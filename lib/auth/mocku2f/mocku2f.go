@@ -37,14 +37,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tstranex/u2f"
 	"github.com/gravitational/trace"
+	"github.com/tstranex/u2f"
 )
 
 type Key struct {
-	keyHandle []byte
-	privatekey *ecdsa.PrivateKey
-	cert []byte
+	KeyHandle  []byte
+	PrivateKey *ecdsa.PrivateKey
+
+	cert    []byte
 	counter uint32
 }
 
@@ -71,12 +72,12 @@ func selfSignPublicKey(keyToSign *ecdsa.PublicKey) (cert []byte, err error) {
 		Subject: pkix.Name{
 			Organization: []string{"Test CA"},
 		},
-		NotBefore: time.Now(),
-		NotAfter: time.Now().Add(time.Hour),
-		KeyUsage: x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		IsCA: true,
+		IsCA:                  true,
 	}
 	cert, err = x509.CreateCertificate(rand.Reader, &template, &template, keyToSign, caPrivateKey)
 	if err != nil {
@@ -110,10 +111,10 @@ func CreateWithKeyHandle(keyHandle []byte) (*Key, error) {
 	}
 
 	return &Key{
-		keyHandle: keyHandle,
-		privatekey: privatekey,
-		cert: cert,
-		counter: 1,
+		KeyHandle:  keyHandle,
+		PrivateKey: privatekey,
+		cert:       cert,
+		counter:    1,
 	}, nil
 }
 
@@ -121,44 +122,44 @@ func (muk *Key) RegisterResponse(req *u2f.RegisterRequest) (*u2f.RegisterRespons
 	appIDHash := sha256.Sum256([]byte(req.AppID))
 
 	clientData := u2f.ClientData{
-		Typ: "navigator.id.finishEnrollment",
+		Typ:       "navigator.id.finishEnrollment",
 		Challenge: req.Challenge,
-		Origin: req.AppID,
+		Origin:    req.AppID,
 	}
-	clientDataJson, err := json.Marshal(clientData)
+	clientDataJSON, err := json.Marshal(clientData)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	clientDataHash := sha256.Sum256(clientDataJson)
+	clientDataHash := sha256.Sum256(clientDataJSON)
 
-	marshalledPublickey := elliptic.Marshal(elliptic.P256(), muk.privatekey.PublicKey.X, muk.privatekey.PublicKey.Y)
+	marshalledPublickey := elliptic.Marshal(elliptic.P256(), muk.PrivateKey.PublicKey.X, muk.PrivateKey.PublicKey.Y)
 
 	var dataToSign []byte
-	dataToSign = append(dataToSign[:], []byte{ 0 }[:]...)
+	dataToSign = append(dataToSign[:], 0)
 	dataToSign = append(dataToSign[:], appIDHash[:]...)
 	dataToSign = append(dataToSign[:], clientDataHash[:]...)
-	dataToSign = append(dataToSign[:], muk.keyHandle[:]...)
+	dataToSign = append(dataToSign[:], muk.KeyHandle[:]...)
 	dataToSign = append(dataToSign[:], marshalledPublickey[:]...)
 
 	dataHash := sha256.Sum256(dataToSign)
 
 	// Despite taking a hash function, this actually does not hash the input.
-	sig, err := muk.privatekey.Sign(rand.Reader, dataHash[:], crypto.SHA256)
+	sig, err := muk.PrivateKey.Sign(rand.Reader, dataHash[:], crypto.SHA256)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	var regData []byte
-	regData  = append(regData, []byte{ 5 }[:]...) // fixed by specification
+	regData = append(regData, 5) // fixed by specification
 	regData = append(regData, marshalledPublickey[:]...)
-	regData = append(regData, []byte{ byte(len(muk.keyHandle)) }[:]...)
-	regData = append(regData, muk.keyHandle[:]...)
+	regData = append(regData, byte(len(muk.KeyHandle)))
+	regData = append(regData, muk.KeyHandle[:]...)
 	regData = append(regData, muk.cert[:]...)
 	regData = append(regData, sig[:]...)
 
 	return &u2f.RegisterResponse{
 		RegistrationData: encodeBase64(regData),
-		ClientData: encodeBase64(clientDataJson),
+		ClientData:       encodeBase64(clientDataJSON),
 	}, nil
 }
 
@@ -167,54 +168,52 @@ func (muk *Key) SignResponse(req *u2f.SignRequest) (*u2f.SignResponse, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if !bytes.Equal(rawKeyHandle, muk.keyHandle) {
+	if !bytes.Equal(rawKeyHandle, muk.KeyHandle) {
 		return nil, trace.CompareFailed("wrong keyHandle")
 	}
-
 	appIDHash := sha256.Sum256([]byte(req.AppID))
 
 	counterBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(counterBytes, muk.counter)
-	muk.counter += 1
+	muk.counter++
 
 	clientData := u2f.ClientData{
-		Typ: "navigator.id.getAssertion",
+		Typ:       "navigator.id.getAssertion",
 		Challenge: req.Challenge,
-		Origin: req.AppID,
+		Origin:    req.AppID,
 	}
-	clientDataJson, err := json.Marshal(clientData)
+	clientDataJSON, err := json.Marshal(clientData)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	clientDataHash := sha256.Sum256(clientDataJson)
+	clientDataHash := sha256.Sum256(clientDataJSON)
 
 	var dataToSign []byte
 	dataToSign = append(dataToSign, appIDHash[:]...)
-	dataToSign = append(dataToSign, []byte{ 1 }[:]...) // user presence
+	dataToSign = append(dataToSign, 1) // user presence
 	dataToSign = append(dataToSign, counterBytes[:]...)
 	dataToSign = append(dataToSign, clientDataHash[:]...)
 
 	dataHash := sha256.Sum256(dataToSign)
 
 	// Despite taking a hash function, this actually does not hash the input.
-	sig, err := muk.privatekey.Sign(rand.Reader, dataHash[:], crypto.SHA256)
+	sig, err := muk.PrivateKey.Sign(rand.Reader, dataHash[:], crypto.SHA256)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	var signData []byte
-	signData = append(signData, []byte{ 1 }[:]...) // user presence
+	signData = append(signData, 1) // user presence
 	signData = append(signData, counterBytes[:]...)
 	signData = append(signData, sig[:]...)
 
 	return &u2f.SignResponse{
-		KeyHandle: req.KeyHandle,
+		KeyHandle:     req.KeyHandle,
 		SignatureData: encodeBase64(signData),
-		ClientData: encodeBase64(clientDataJson),
+		ClientData:    encodeBase64(clientDataJSON),
 	}, nil
 }
 
 func (muk *Key) SetCounter(counter uint32) {
 	muk.counter = counter
 }
-

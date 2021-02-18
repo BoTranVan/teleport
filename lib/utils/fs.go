@@ -17,48 +17,79 @@ limitations under the License.
 package utils
 
 import (
-	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/trace"
 )
 
-// IsFile returns true if a given file path points to an existing file
-func IsFile(fp string) bool {
-	fi, err := os.Stat(fp)
-	if err == nil {
-		return !fi.IsDir()
+// EnsureLocalPath makes sure the path exists, or, if omitted results in the subpath in
+// default gravity config directory, e.g.
+//
+// EnsureLocalPath("/custom/myconfig", ".gravity", "config") -> /custom/myconfig
+// EnsureLocalPath("", ".gravity", "config") -> ${HOME}/.gravity/config
+//
+// It also makes sure that base dir exists
+func EnsureLocalPath(customPath string, defaultLocalDir, defaultLocalPath string) (string, error) {
+	if customPath == "" {
+		homeDir := getHomeDir()
+		if homeDir == "" {
+			return "", trace.BadParameter("no path provided and environment variable %v is not not set", teleport.EnvHome)
+		}
+		customPath = filepath.Join(homeDir, defaultLocalDir, defaultLocalPath)
 	}
-	return false
+	baseDir := filepath.Dir(customPath)
+	_, err := StatDir(baseDir)
+	if err != nil {
+		if trace.IsNotFound(err) {
+			if err := MkdirAll(baseDir, teleport.PrivateDirMode); err != nil {
+				return "", trace.Wrap(err)
+			}
+		} else {
+			return "", trace.Wrap(err)
+		}
+	}
+	return customPath, nil
+}
+
+// MkdirAll creates directory and subdirectories
+func MkdirAll(targetDirectory string, mode os.FileMode) error {
+	err := os.MkdirAll(targetDirectory, mode)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	return nil
+}
+
+// RemoveDirCloser removes directory and all it's contents
+// when Close is called
+type RemoveDirCloser struct {
+	Path string
+}
+
+// Close removes directory and all it's contents
+func (r *RemoveDirCloser) Close() error {
+	return trace.ConvertSystemError(os.RemoveAll(r.Path))
 }
 
 // IsDir is a helper function to quickly check if a given path is a valid directory
-func IsDir(dirPath string) bool {
-	fi, err := os.Stat(dirPath)
+func IsDir(path string) bool {
+	fi, err := os.Stat(path)
 	if err == nil {
 		return fi.IsDir()
 	}
 	return false
 }
 
-// ReadAll is similarl to ioutil.ReadAll, except it doesn't use ever-increasing
-// internal buffer, instead asking for the exact buffer size.
-//
-// This is useful when you want to limit the sze of Read/Writes (websockets)
-func ReadAll(r io.Reader, bufsize int) (out []byte, err error) {
-	buff := make([]byte, bufsize)
-	n := 0
-	for err == nil {
-		n, err = r.Read(buff)
-		if n > 0 {
-			out = append(out, buff[:n]...)
-		}
+// IsFile is a convenience helper to check if the given path is a regular file
+func IsFile(path string) bool {
+	fi, err := os.Stat(path)
+	if err == nil {
+		return fi.Mode().IsRegular()
 	}
-	if err == io.EOF {
-		err = nil
-	}
-	return out, err
+	return false
 }
 
 // NormalizePath normalises path, evaluating symlinks and converting local
@@ -95,6 +126,22 @@ func OpenFile(path string) (*os.File, error) {
 	return f, nil
 }
 
+// StatFile stats path, returns error if it exists but a directory.
+func StatFile(path string) (os.FileInfo, error) {
+	newPath, err := NormalizePath(path)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	fi, err := os.Stat(newPath)
+	if err != nil {
+		return nil, trace.ConvertSystemError(err)
+	}
+	if fi.IsDir() {
+		return nil, trace.BadParameter("%v is not a file", path)
+	}
+	return fi, nil
+}
+
 // StatDir stats directory, returns error if file exists, but not a directory
 func StatDir(path string) (os.FileInfo, error) {
 	fi, err := os.Stat(path)
@@ -105,4 +152,17 @@ func StatDir(path string) (os.FileInfo, error) {
 		return nil, trace.BadParameter("%v is not a directory", path)
 	}
 	return fi, nil
+}
+
+// getHomeDir returns the home directory based off the OS.
+func getHomeDir() string {
+	switch runtime.GOOS {
+	case teleport.LinuxOS:
+		return os.Getenv(teleport.EnvHome)
+	case teleport.DarwinOS:
+		return os.Getenv(teleport.EnvHome)
+	case teleport.WindowsOS:
+		return os.Getenv(teleport.EnvUserProfile)
+	}
+	return ""
 }

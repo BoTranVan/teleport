@@ -19,13 +19,10 @@ package utils
 import (
 	"net"
 	"strings"
-	"testing"
 
 	. "gopkg.in/check.v1"
 	"gopkg.in/yaml.v2"
 )
-
-func TestAddrStruct(t *testing.T) { TestingT(t) }
 
 type AddrTestSuite struct {
 }
@@ -39,6 +36,12 @@ func (s *AddrTestSuite) TestParseHostPort(c *C) {
 	c.Assert(addr.AddrNetwork, Equals, "tcp")
 	c.Assert(addr.Addr, Equals, "localhost:22")
 
+	// scheme + existing port
+	addr, err = ParseHostPortAddr("https://localhost", 443)
+	c.Assert(err, IsNil)
+	c.Assert(addr.AddrNetwork, Equals, "https")
+	c.Assert(addr.Addr, Equals, "localhost:443")
+
 	// success
 	addr, err = ParseHostPortAddr("localhost", 1111)
 	c.Assert(err, IsNil)
@@ -49,6 +52,10 @@ func (s *AddrTestSuite) TestParseHostPort(c *C) {
 	addr, err = ParseHostPortAddr("localhost", -1)
 	c.Assert(err, NotNil)
 	c.Assert(addr, IsNil)
+
+	// scheme + missing port
+	_, err = ParseHostPortAddr("https://localhost", -1)
+	c.Assert(err, NotNil)
 }
 
 func (s *AddrTestSuite) TestEmpty(c *C) {
@@ -63,6 +70,49 @@ func (s *AddrTestSuite) TestParse(c *C) {
 	c.Assert(addr.Addr, Equals, "one:25")
 	c.Assert(addr.Path, Equals, "/path")
 	c.Assert(addr.FullAddress(), Equals, "tcp://one:25")
+	c.Assert(addr.IsEmpty(), Equals, false)
+	c.Assert(addr.Host(), Equals, "one")
+	c.Assert(addr.Port(0), Equals, 25)
+}
+
+func (s *AddrTestSuite) TestParseIPV6(c *C) {
+	addr, err := ParseAddr("[::1]:49870")
+	c.Assert(err, IsNil)
+	c.Assert(addr, NotNil)
+	c.Assert(addr.Addr, Equals, "[::1]:49870")
+	c.Assert(addr.Path, Equals, "")
+	c.Assert(addr.FullAddress(), Equals, "tcp://[::1]:49870")
+	c.Assert(addr.IsEmpty(), Equals, false)
+	c.Assert(addr.Host(), Equals, "::1")
+	c.Assert(addr.Port(0), Equals, 49870)
+
+	// Just square brackets is also valid
+	addr, err = ParseAddr("[::1]")
+	c.Assert(err, IsNil)
+	c.Assert(addr, NotNil)
+	c.Assert(addr.Addr, Equals, "[::1]")
+	c.Assert(addr.Host(), Equals, "::1")
+}
+
+func (s *AddrTestSuite) TestParseEmptyPort(c *C) {
+	addr, err := ParseAddr("one")
+	c.Assert(err, IsNil)
+	c.Assert(addr, NotNil)
+	c.Assert(addr.Addr, Equals, "one")
+	c.Assert(addr.Path, Equals, "")
+	c.Assert(addr.FullAddress(), Equals, "tcp://one")
+	c.Assert(addr.IsEmpty(), Equals, false)
+	c.Assert(addr.Host(), Equals, "one")
+	c.Assert(addr.Port(443), Equals, 443)
+}
+
+func (s *AddrTestSuite) TestParseHTTP(c *C) {
+	addr, err := ParseAddr("http://one:25/path")
+	c.Assert(err, IsNil)
+	c.Assert(addr, NotNil)
+	c.Assert(addr.Addr, Equals, "one:25")
+	c.Assert(addr.Path, Equals, "/path")
+	c.Assert(addr.FullAddress(), Equals, "http://one:25")
 	c.Assert(addr.IsEmpty(), Equals, false)
 }
 
@@ -85,6 +135,10 @@ func (s *AddrTestSuite) TestReplaceLocalhost(c *C) {
 	c.Assert(result, Equals, "192.168.1.100:22")
 	result = ReplaceLocalhost("0.0.0.0:22", "192.168.1.100:399")
 	c.Assert(result, Equals, "192.168.1.100:22")
+	result = ReplaceLocalhost("[::]:22", "192.168.1.100:399")
+	c.Assert(result, Equals, "192.168.1.100:22")
+	result = ReplaceLocalhost("[::]:22", "[1::1]:399")
+	c.Assert(result, Equals, "[1::1]:22")
 }
 
 func (s *AddrTestSuite) TestLocalAddrs(c *C) {
@@ -134,51 +188,65 @@ func (s *AddrTestSuite) TestGuessesIPAddress(c *C) {
 		{
 			addrs: []net.Addr{
 				&net.IPAddr{IP: net.ParseIP("10.0.100.80")},
-				&net.IPAddr{IP: net.ParseIP("192.13.1.80")},
-				&net.IPAddr{IP: net.ParseIP("172.192.12.1")},
+				&net.IPAddr{IP: net.ParseIP("192.168.1.80")},
+				&net.IPAddr{IP: net.ParseIP("172.16.0.0")},
+				&net.IPAddr{IP: net.ParseIP("172.31.255.255")},
 			},
 			expected: net.ParseIP("10.0.100.80"),
-			comment:  "prefers 10.x.y.z",
+			comment:  "prefers 10.0.0.0/8",
 		},
 		{
 			addrs: []net.Addr{
-				&net.IPAddr{IP: net.ParseIP("192.13.1.80")},
-				&net.IPAddr{IP: net.ParseIP("172.192.12.1")},
+				&net.IPAddr{IP: net.ParseIP("192.168.1.80")},
+				&net.IPAddr{IP: net.ParseIP("172.31.12.1")},
 			},
-			expected: net.ParseIP("192.13.1.80"),
-			comment:  "prefers 192.x.y.z",
+			expected: net.ParseIP("192.168.1.80"),
+			comment:  "prefers 192.168.0.0/16",
 		},
 		{
 			addrs: []net.Addr{
-				&net.IPAddr{IP: net.ParseIP("172.192.12.1")},
+				&net.IPAddr{IP: net.ParseIP("192.167.255.255")},
+				&net.IPAddr{IP: net.ParseIP("172.15.0.0")},
+				&net.IPAddr{IP: net.ParseIP("172.32.1.1")},
+				&net.IPAddr{IP: net.ParseIP("172.30.1.1")},
+			},
+			expected: net.ParseIP("172.30.1.1"),
+			comment:  "identifies private IP by netmask",
+		},
+		{
+			addrs: []net.Addr{
+				&net.IPAddr{IP: net.ParseIP("172.1.1.1")},
+				&net.IPAddr{IP: net.ParseIP("172.30.0.1")},
 				&net.IPAddr{IP: net.ParseIP("52.35.21.180")},
 			},
-			expected: net.ParseIP("172.192.12.1"),
-			comment:  "prefers 172.x.y.z",
+			expected: net.ParseIP("172.30.0.1"),
+			comment:  "prefers 172.16.0.0/12",
 		},
 		{
 			addrs: []net.Addr{
-				&net.IPAddr{IP: net.ParseIP("192.192.12.1")},
-				&net.IPAddr{IP: net.ParseIP("192.192.12.2")},
+				&net.IPAddr{IP: net.ParseIP("192.168.12.1")},
+				&net.IPAddr{IP: net.ParseIP("192.168.12.2")},
 				&net.IPAddr{IP: net.ParseIP("52.35.21.180")},
 			},
-			expected: net.ParseIP("192.192.12.2"),
+			expected: net.ParseIP("192.168.12.2"),
 			comment:  "prefers last",
 		},
 		{
 			addrs: []net.Addr{
-				&net.IPAddr{IP: net.ParseIP("52.35.21.180")},
+				&net.IPAddr{IP: net.ParseIP("::1")},
 				&net.IPAddr{IP: net.ParseIP("fe80::af:6dff:fefd:150f")},
+				&net.IPAddr{IP: net.ParseIP("52.35.21.180")},
 			},
 			expected: net.ParseIP("52.35.21.180"),
 			comment:  "ignores IPv6",
 		},
 		{
 			addrs: []net.Addr{
+				&net.IPAddr{IP: net.ParseIP("::1")},
 				&net.IPAddr{IP: net.ParseIP("fe80::af:6dff:fefd:150f")},
 			},
 			expected: net.ParseIP("127.0.0.1"),
-			comment:  "falls back to loopback",
+			comment:  "falls back to ipv4 loopback",
 		},
 	}
 	for _, testCase := range testCases {
@@ -222,5 +290,30 @@ func (s *AddrTestSuite) TestUnmarshal(c *C) {
 		c.Assert(err, IsNil)
 		c.Assert(addr, DeepEquals, testCase.expected,
 			Commentf("test case %v, %v should be unmarshalled to: %v", i, testCase.in, testCase.expected))
+	}
+}
+
+func (s *AddrTestSuite) TestParseMultiple(c *C) {
+	tests := []struct {
+		in  []string
+		out []NetAddr
+	}{
+		{
+			in: []string{
+				"https://localhost:3080",
+				"tcp://example:587/path",
+				"[::1]:465",
+			},
+			out: []NetAddr{
+				{Addr: "localhost:3080", AddrNetwork: "https"},
+				{Addr: "example:587", AddrNetwork: "tcp", Path: "/path"},
+				{Addr: "[::1]:465", AddrNetwork: "tcp"},
+			},
+		},
+	}
+	for _, test := range tests {
+		parsed, err := ParseAddrs(test.in)
+		c.Assert(err, IsNil)
+		c.Assert(parsed, DeepEquals, test.out)
 	}
 }

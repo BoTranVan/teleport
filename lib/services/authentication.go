@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Gravitational, Inc.
+Copyright 2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,148 +14,261 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package types contains all types and logic required by the Teleport API.
+
 package services
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"time"
 
-	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth/u2f"
 	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
+	"golang.org/x/crypto/bcrypt"
 )
 
-// ClusterAuthPreference defines an interface to get and set
-// authentication preferences for a cluster.
-type ClusterAuthPreference interface {
-	// GetClusterAuthPreference returns the authentication preferences for a cluster.
-	GetClusterAuthPreference() (AuthPreference, error)
-
-	// SetClusterAuthPreference sets the authentication preferences for a cluster.
-	SetClusterAuthPreference(AuthPreference) error
-}
-
-// AuthPreference defines the authentication preferences for a specific
-// cluster. It defines the type (local, oidc) and second factor (off, otp, oidc).
-type AuthPreference interface {
-	// GetType returns the type of authentication.
-	GetType() string
-
-	// SetType sets the type of authentication.
-	SetType(string)
-
-	// GetSecondFactor returns the type of second factor.
-	GetSecondFactor() string
-
-	// SetSecondFactor sets the type of second factor.
-	SetSecondFactor(string)
-
-	// CheckAndSetDefaults sets and default values and then
-	// verifies the constraints for AuthPreference.
-	CheckAndSetDefaults() error
-
-	// String represents a human readable version of authentication settings.
-	String() string
-}
-
-// NewAuthPreference is a convenience method to to create AuthPreferenceV2.
-func NewAuthPreference(spec AuthPreferenceSpecV2) (AuthPreference, error) {
-	return &AuthPreferenceV2{
-		Kind:    KindClusterAuthPreference,
-		Version: V2,
-		Metadata: Metadata{
-			Name:      MetaNameClusterAuthPreference,
-			Namespace: defaults.Namespace,
-		},
-		Spec: spec,
-	}, nil
-}
-
-// AuthPreferenceV2 implements AuthPreference.
-type AuthPreferenceV2 struct {
-	// Kind is a resource kind - always resource.
-	Kind string `json:"kind"`
-
-	// Version is a resource version.
-	Version string `json:"version"`
-
-	// Metadata is metadata about the resource.
-	Metadata Metadata `json:"metadata"`
-
-	// Spec is the specification of the resource.
-	Spec AuthPreferenceSpecV2 `json:"spec"`
-}
-
-// AuthPreferenceSpecV2 is the actual data we care about for AuthPreferenceV2.
-type AuthPreferenceSpecV2 struct {
-	// Type is the type of authentication.
-	Type string `json:"type"`
-
-	// SecondFactor is the type of second factor.
-	SecondFactor string `json:"second_factor"`
-}
-
-// GetType returns the type of authentication.
-func (c *AuthPreferenceV2) GetType() string {
-	return c.Spec.Type
-}
-
-// SetType sets the type of authentication.
-func (c *AuthPreferenceV2) SetType(s string) {
-	c.Spec.Type = s
-}
-
-// GetSecondFactor returns the type of second factor.
-func (c *AuthPreferenceV2) GetSecondFactor() string {
-	return c.Spec.SecondFactor
-}
-
-// SetSecondFactor sets the type of second factor.
-func (c *AuthPreferenceV2) SetSecondFactor(s string) {
-	c.Spec.SecondFactor = s
-}
-
-// CheckAndSetDefaults verifies the constraints for AuthPreference.
-func (c *AuthPreferenceV2) CheckAndSetDefaults() error {
-	// if nothing is passed in, set defaults
-	if c.Spec.Type == "" {
-		c.Spec.Type = teleport.Local
-	}
-	if c.Spec.SecondFactor == "" && c.Spec.Type == teleport.Local {
-		c.Spec.SecondFactor = teleport.OTP
-	}
-
-	// make sure whatever was passed in was sane
-	switch c.Spec.Type {
-	case teleport.Local:
-		if c.Spec.SecondFactor != teleport.OFF && c.Spec.SecondFactor != teleport.OTP && c.Spec.SecondFactor != teleport.U2F {
-			return trace.BadParameter("second factor type %q not supported", c.Spec.SecondFactor)
+// ValidateLocalAuthSecrets validates local auth secret members.
+func ValidateLocalAuthSecrets(l *LocalAuthSecrets) error {
+	if len(l.PasswordHash) > 0 {
+		if _, err := bcrypt.Cost(l.PasswordHash); err != nil {
+			return trace.BadParameter("invalid password hash")
 		}
-	case teleport.OIDC:
-		if c.Spec.SecondFactor != "" {
-			return trace.BadParameter("second factor [%q] not supported with oidc connector")
-		}
-	default:
-		return trace.BadParameter("unsupported type %q", c.Spec.Type)
 	}
-
+	mfaNames := make(map[string]struct{}, len(l.MFA))
+	for _, d := range l.MFA {
+		if err := ValidateMFADevice(d); err != nil {
+			return trace.BadParameter("MFA device named %q is invalid: %v", d.Metadata.Name, err)
+		}
+		if _, ok := mfaNames[d.Metadata.Name]; ok {
+			return trace.BadParameter("MFA device named %q already exists", d.Metadata.Name)
+		}
+		mfaNames[d.Metadata.Name] = struct{}{}
+	}
 	return nil
 }
 
-// String represents a human readable version of authentication settings.
-func (c *AuthPreferenceV2) String() string {
-	return fmt.Sprintf("AuthPreference(Type=%q,SecondFactor=%q)", c.Spec.Type, c.Spec.SecondFactor)
+// LocalAuthSecretsEquals checks equality (nil safe).
+func LocalAuthSecretsEquals(l *LocalAuthSecrets, other *LocalAuthSecrets) bool {
+	if (l == nil) || (other == nil) {
+		return l == other
+	}
+	if !bytes.Equal(l.PasswordHash, other.PasswordHash) {
+		return false
+	}
+	if len(l.MFA) != len(other.MFA) {
+		return false
+	}
+	mfa := make(map[string]*types.MFADevice, len(l.MFA))
+	for i, d := range l.MFA {
+		mfa[d.Id] = l.MFA[i]
+	}
+	mfaOther := make(map[string]*types.MFADevice, len(other.MFA))
+	for i, d := range other.MFA {
+		mfaOther[d.Id] = other.MFA[i]
+	}
+	for id, d := range mfa {
+		od, ok := mfaOther[id]
+		if !ok {
+			return false
+		}
+		if !mfaDeviceEquals(d, od) {
+			return false
+		}
+	}
+	return true
 }
 
+// NewTOTPDevice creates a TOTP MFADevice from the given key.
+func NewTOTPDevice(name, key string, addedAt time.Time) (*types.MFADevice, error) {
+	d := types.NewMFADevice(name, addedAt)
+	d.Device = &types.MFADevice_Totp{Totp: &types.TOTPDevice{
+		Key: key,
+	}}
+	if err := ValidateMFADevice(d); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return d, nil
+}
+
+// ValidateMFADevice validates the MFA device. It's a more in-depth version of
+// MFADevice.CheckAndSetDefaults.
+//
+// TODO(awly): refactor to keep basic and deep validation on one place.
+func ValidateMFADevice(d *types.MFADevice) error {
+	if err := d.CheckAndSetDefaults(); err != nil {
+		return trace.Wrap(err)
+	}
+	switch dd := d.Device.(type) {
+	case *types.MFADevice_Totp:
+		if err := validateTOTPDevice(dd.Totp); err != nil {
+			return trace.Wrap(err)
+		}
+	case *types.MFADevice_U2F:
+		if err := u2f.ValidateDevice(dd.U2F); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		return trace.BadParameter("MFADevice has Device field of unknown type %T", d.Device)
+	}
+	return nil
+}
+
+func validateTOTPDevice(d *types.TOTPDevice) error {
+	if d.Key == "" {
+		return trace.BadParameter("TOTPDevice missing Key field")
+	}
+	return nil
+}
+
+func mfaDeviceEquals(d, other *types.MFADevice) bool {
+	if (d == nil) || (other == nil) {
+		return d == other
+	}
+	if d.Kind != other.Kind {
+		return false
+	}
+	if d.SubKind != other.SubKind {
+		return false
+	}
+	if d.Version != other.Version {
+		return false
+	}
+	if d.Metadata.Name != other.Metadata.Name {
+		return false
+	}
+	if d.Id != other.Id {
+		return false
+	}
+	if !d.AddedAt.Equal(other.AddedAt) {
+		return false
+	}
+	// Ignore LastUsed, it's a very dynamic field.
+	if !totpDeviceEquals(d.GetTotp(), other.GetTotp()) {
+		return false
+	}
+	if !u2fDeviceEquals(d.GetU2F(), other.GetU2F()) {
+		return false
+	}
+	return true
+}
+
+func totpDeviceEquals(d, other *types.TOTPDevice) bool {
+	if (d == nil) || (other == nil) {
+		return d == other
+	}
+	return d.Key == other.Key
+}
+
+func u2fDeviceEquals(d, other *types.U2FDevice) bool {
+	if (d == nil) || (other == nil) {
+		return d == other
+	}
+	if !bytes.Equal(d.KeyHandle, other.KeyHandle) {
+		return false
+	}
+	if !bytes.Equal(d.PubKey, other.PubKey) {
+		return false
+	}
+	// Ignore the counter, it's a very dynamic value.
+	return true
+}
+
+// AuthPreferenceSpecSchemaTemplate is JSON schema for AuthPreferenceSpec
 const AuthPreferenceSpecSchemaTemplate = `{
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "type": {"type": "string"},
-    "second_factor": {"type": "string"}%v
-  }
+	"type": "object",
+	"additionalProperties": false,
+	"properties": {
+		"type": {
+			"type": "string"
+		},
+		"second_factor": {
+			"type": "string"
+		},
+		"connector_name": {
+			"type": "string"
+		},
+		"u2f": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"app_id": {
+					"type": "string"
+				},
+				"facets": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				}
+			}
+		}%v
+	}
+}`
+
+// LocalAuthSecretsSchema is a JSON schema for LocalAuthSecrets
+const LocalAuthSecretsSchema = `{
+	"type": "object",
+	"additionalProperties": false,
+	"properties": {
+		"password_hash": {"type": "string"},
+		"totp_key": {"type": "string"},
+		"u2f_registration": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"raw": {"type": "string"},
+				"key_handle": {"type": "string"},
+				"pubkey": {"type": "string"}
+			}
+		},
+		"u2f_counter": {"type": "number"},
+		"mfa": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"additionalProperties": false,
+				"properties": {
+					"kind": {"type": "string"},
+					"subKind": {"type": "string"},
+					"version": {"type": "string"},
+					"metadata": {
+						"type": "object",
+						"additionalProperties": false,
+						"properties": {
+							"Name": {"type": "string"},
+							"Namespace": {"type": "string"}
+						}
+					},
+					"id": {"type": "string"},
+					"name": {"type": "string"},
+					"addedAt": {"type": "string"},
+					"lastUsed": {"type": "string"},
+					"totp": {
+						"type": "object",
+						"additionalProperties": false,
+						"properties": {
+							"key": {"type": "string"}
+						}
+					},
+					"u2f": {
+						"type": "object",
+						"additionalProperties": false,
+						"properties": {
+							"raw": {"type": "string"},
+							"keyHandle": {"type": "string"},
+							"pubKey": {"type": "string"},
+							"counter": {"type": "number"}
+						}
+					}
+				}
+			}
+		}
+	}
 }`
 
 // GetAuthPreferenceSchema returns the schema with optionally injected
@@ -167,49 +280,42 @@ func GetAuthPreferenceSchema(extensionSchema string) string {
 	} else {
 		authPreferenceSchema = fmt.Sprintf(AuthPreferenceSpecSchemaTemplate, ","+extensionSchema)
 	}
-	return fmt.Sprintf(V2SchemaTemplate, MetadataSchema, authPreferenceSchema)
+	return fmt.Sprintf(V2SchemaTemplate, MetadataSchema, authPreferenceSchema, DefaultDefinitions)
 }
 
-// AuthPreferenceMarshaler implements marshal/unmarshal of AuthPreference implementations
-// mostly adds support for extended versions.
-type AuthPreferenceMarshaler interface {
-	Marshal(c AuthPreference, opts ...MarshalOption) ([]byte, error)
-	Unmarshal(bytes []byte) (AuthPreference, error)
-}
-
-var authPreferenceMarshaler AuthPreferenceMarshaler = &TeleportAuthPreferenceMarshaler{}
-
-func SetAuthPreferenceMarshaler(m AuthPreferenceMarshaler) {
-	marshalerMutex.Lock()
-	defer marshalerMutex.Unlock()
-	authPreferenceMarshaler = m
-}
-
-func GetAuthPreferenceMarshaler() AuthPreferenceMarshaler {
-	marshalerMutex.Lock()
-	defer marshalerMutex.Unlock()
-	return authPreferenceMarshaler
-}
-
-type TeleportAuthPreferenceMarshaler struct{}
-
-// Unmarshal unmarshals role from JSON or YAML.
-func (t *TeleportAuthPreferenceMarshaler) Unmarshal(bytes []byte) (AuthPreference, error) {
+// UnmarshalAuthPreference unmarshals the AuthPreference resource from JSON.
+func UnmarshalAuthPreference(bytes []byte, opts ...MarshalOption) (AuthPreference, error) {
 	var authPreference AuthPreferenceV2
 
 	if len(bytes) == 0 {
 		return nil, trace.BadParameter("missing resource data")
 	}
 
-	err := utils.UnmarshalWithSchema(GetAuthPreferenceSchema(""), &authPreference, bytes)
+	cfg, err := CollectOptions(opts)
 	if err != nil {
-		return nil, trace.BadParameter(err.Error())
+		return nil, trace.Wrap(err)
 	}
 
+	if cfg.SkipValidation {
+		if err := utils.FastUnmarshal(bytes, &authPreference); err != nil {
+			return nil, trace.BadParameter(err.Error())
+		}
+	} else {
+		err := utils.UnmarshalWithSchema(GetAuthPreferenceSchema(""), &authPreference, bytes)
+		if err != nil {
+			return nil, trace.BadParameter(err.Error())
+		}
+	}
+	if cfg.ID != 0 {
+		authPreference.SetResourceID(cfg.ID)
+	}
+	if !cfg.Expires.IsZero() {
+		authPreference.SetExpiry(cfg.Expires)
+	}
 	return &authPreference, nil
 }
 
-// Marshal marshals role to JSON or YAML.
-func (t *TeleportAuthPreferenceMarshaler) Marshal(c AuthPreference, opts ...MarshalOption) ([]byte, error) {
+// MarshalAuthPreference marshals the AuthPreference resource to JSON.
+func MarshalAuthPreference(c AuthPreference, opts ...MarshalOption) ([]byte, error) {
 	return json.Marshal(c)
 }

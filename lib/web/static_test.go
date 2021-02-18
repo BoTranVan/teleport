@@ -19,10 +19,7 @@ package web
 import (
 	"io"
 	"io/ioutil"
-	"net/http"
-	"os"
-
-	"github.com/gravitational/teleport"
+	"strings"
 
 	"gopkg.in/check.v1"
 )
@@ -32,28 +29,20 @@ type StaticSuite struct {
 
 var _ = check.Suite(&StaticSuite{})
 
-func (s *StaticSuite) SetUpSuite(c *check.C) {
-	debugAssetsPath = "../../web/dist"
-}
-
-func (s *StaticSuite) TestDebugModeEnv(c *check.C) {
-	c.Assert(isDebugMode(), check.Equals, false)
-	os.Setenv(teleport.DebugEnvVar, "no")
-	c.Assert(isDebugMode(), check.Equals, false)
-	os.Setenv(teleport.DebugEnvVar, "0")
-	c.Assert(isDebugMode(), check.Equals, false)
-	os.Setenv(teleport.DebugEnvVar, "1")
-	c.Assert(isDebugMode(), check.Equals, true)
-	os.Setenv(teleport.DebugEnvVar, "true")
-	c.Assert(isDebugMode(), check.Equals, true)
-}
-
 func (s *StaticSuite) TestLocalFS(c *check.C) {
-	fs, err := NewStaticFileSystem(true)
+	fs, err := NewDebugFileSystem("../../webassets/teleport")
 	c.Assert(err, check.IsNil)
 	c.Assert(fs, check.NotNil)
 
-	checkFS(fs, c)
+	f, err := fs.Open("/index.html")
+	c.Assert(err, check.IsNil)
+	bytes, err := ioutil.ReadAll(f)
+	c.Assert(err, check.IsNil)
+
+	html := string(bytes[:])
+	c.Assert(f.Close(), check.IsNil)
+	c.Assert(strings.Contains(html, `<script src="/web/config.js"></script>`), check.Equals, true)
+	c.Assert(strings.Contains(html, `content="{{ .XCSRF }}"`), check.Equals, true)
 }
 
 func (s *StaticSuite) TestZipFS(c *check.C) {
@@ -61,10 +50,6 @@ func (s *StaticSuite) TestZipFS(c *check.C) {
 	c.Assert(err, check.IsNil)
 	c.Assert(fs, check.NotNil)
 
-	checkFS(fs, c)
-}
-
-func checkFS(fs http.FileSystem, c *check.C) {
 	// test simple full read:
 	f, err := fs.Open("/index.html")
 	c.Assert(err, check.IsNil)
@@ -88,13 +73,16 @@ func checkFS(fs http.FileSystem, c *check.C) {
 
 	n, err = f.Seek(-50, io.SeekEnd)
 	c.Assert(err, check.IsNil)
+	c.Assert(n, check.Equals, int64(763))
 	bytes, err = ioutil.ReadAll(f)
 	c.Assert(err, check.IsNil)
 	c.Assert(len(bytes), check.Equals, 50)
 
-	f.Seek(-50, io.SeekEnd)
+	_, err = f.Seek(-50, io.SeekEnd)
+	c.Assert(err, check.IsNil)
 	n, err = f.Seek(-50, io.SeekCurrent)
 	c.Assert(err, check.IsNil)
+	c.Assert(n, check.Equals, int64(713))
 	bytes, err = ioutil.ReadAll(f)
 	c.Assert(err, check.IsNil)
 	c.Assert(len(bytes), check.Equals, 100)

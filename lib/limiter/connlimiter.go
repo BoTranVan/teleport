@@ -20,10 +20,10 @@ import (
 	"net/http"
 	"sync"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/gravitational/oxy/connlimit"
+	"github.com/gravitational/oxy/utils"
 	"github.com/gravitational/trace"
-	"github.com/vulcand/oxy/connlimit"
-	"github.com/vulcand/oxy/utils"
+	log "github.com/sirupsen/logrus"
 )
 
 // ConnectionsLimiter is a network connection limiter and tracker
@@ -36,7 +36,7 @@ type ConnectionsLimiter struct {
 
 // NewConnectionsLimiter returns new connection limiter, in case if connection
 // limits are not set, they won't be tracked
-func NewConnectionsLimiter(config LimiterConfig) (*ConnectionsLimiter, error) {
+func NewConnectionsLimiter(config Config) (*ConnectionsLimiter, error) {
 	limiter := ConnectionsLimiter{
 		Mutex:          &sync.Mutex{},
 		maxConnections: config.MaxConnections,

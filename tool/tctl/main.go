@@ -21,5 +21,17 @@ import (
 )
 
 func main() {
-	common.Run()
+	commands := []common.CLICommand{
+		&common.UserCommand{},
+		&common.NodeCommand{},
+		&common.TokenCommand{},
+		&common.AuthCommand{},
+		&common.ResourceCommand{},
+		&common.StatusCommand{},
+		&common.TopCommand{},
+		&common.AccessRequestCommand{},
+		&common.AppsCommand{},
+		&common.DBCommand{},
+	}
+	common.Run(commands, nil)
 }

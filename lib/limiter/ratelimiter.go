@@ -22,11 +22,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gravitational/oxy/ratelimit"
+	"github.com/gravitational/oxy/utils"
 	"github.com/gravitational/trace"
 	"github.com/mailgun/timetools"
 	"github.com/mailgun/ttlmap"
-	"github.com/vulcand/oxy/ratelimit"
-	"github.com/vulcand/oxy/utils"
 )
 
 // RateLimiter controls connection rate, it uses token bucket algo
@@ -47,7 +47,7 @@ type Rate struct {
 }
 
 // NewRateLimiter returns new request rate controller
-func NewRateLimiter(config LimiterConfig) (*RateLimiter, error) {
+func NewRateLimiter(config Config) (*RateLimiter, error) {
 	limiter := RateLimiter{
 		Mutex: &sync.Mutex{},
 	}

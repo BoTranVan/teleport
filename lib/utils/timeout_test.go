@@ -18,6 +18,7 @@ limitations under the License.
 package utils
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -31,8 +32,7 @@ import (
 // TimeoutSuite helps us to test ObeyTimeout mechanism. We use HTTP server/client
 // machinery to test timeouts
 type TimeoutSuite struct {
-	lastRequest *http.Request
-	server      *httptest.Server
+	server *httptest.Server
 }
 
 var _ = check.Suite(&TimeoutSuite{})
@@ -62,25 +62,29 @@ func (s *TimeoutSuite) TearDownSuite(c *check.C) {
 
 func (s *TimeoutSuite) TestSlowOperation(c *check.C) {
 	client := newClient(time.Millisecond * 5)
-	_, err := client.Get(s.server.URL + "/slow?delay=20ms")
+	resp, err := client.Get(s.server.URL + "/slow?delay=20ms")
+	if err == nil {
+		resp.Body.Close()
+	}
 	// must fail with I/O timeout
 	c.Assert(err, check.NotNil)
 	c.Assert(err.Error(), check.Matches, "^.*i/o timeout$")
 }
 
 func (s *TimeoutSuite) TestNormalOperation(c *check.C) {
-	client := newClient(time.Millisecond * 5)
+	client := newClient(time.Millisecond * 100)
 	resp, err := client.Get(s.server.URL + "/ping")
 	c.Assert(err, check.IsNil)
 	c.Assert(bodyText(resp), check.Equals, "pong")
 }
 
 // newClient helper returns HTTP client configured to use a connection
-// wich drops itself after N idle time
+// which drops itself after N idle time
 func newClient(timeout time.Duration) *http.Client {
 	var t http.Transport
-	t.Dial = func(network string, addr string) (net.Conn, error) {
-		conn, err := net.Dial(network, addr)
+	t.DialContext = func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		var d net.Dialer
+		conn, err := d.DialContext(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}

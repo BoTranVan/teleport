@@ -17,8 +17,8 @@ limitations under the License.
 package local
 
 import (
+	"context"
 	"sort"
-	"time"
 
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/services"
@@ -38,44 +38,63 @@ func NewAccessService(backend backend.Backend) *AccessService {
 
 // DeleteAllRoles deletes all roles
 func (s *AccessService) DeleteAllRoles() error {
-	return s.DeleteBucket([]string{}, "roles")
+	return s.DeleteRange(context.TODO(), backend.Key(rolesPrefix), backend.RangeEnd(backend.Key(rolesPrefix)))
 }
 
 // GetRoles returns a list of roles registered with the local auth server
 func (s *AccessService) GetRoles() ([]services.Role, error) {
-	keys, err := s.GetKeys([]string{"roles"})
+	result, err := s.GetRange(context.TODO(), backend.Key(rolesPrefix), backend.RangeEnd(backend.Key(rolesPrefix)), backend.NoLimit)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	var out []services.Role
-	for _, name := range keys {
-		u, err := s.GetRole(name)
+	out := make([]services.Role, 0, len(result.Items))
+	for _, item := range result.Items {
+		role, err := services.UnmarshalRole(item.Value,
+			services.WithResourceID(item.ID), services.WithExpires(item.Expires))
 		if err != nil {
-			if trace.IsNotFound(err) {
-				continue
-			}
 			return nil, trace.Wrap(err)
 		}
-		out = append(out, u)
+		out = append(out, role)
 	}
 	sort.Sort(services.SortedRoles(out))
 	return out, nil
 }
 
-// UpsertRole updates parameters about role
-func (s *AccessService) UpsertRole(role services.Role, ttl time.Duration) error {
-	data, err := services.GetRoleMarshaler().MarshalRole(role)
+// CreateRole creates a role on the backend.
+func (s *AccessService) CreateRole(role services.Role) error {
+	value, err := services.MarshalRole(role)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	// TODO(klizhentas): Picking smaller of the two ttls
-	backendTTL := backend.TTL(s.Clock(), role.GetMetadata().Expires)
-	if backendTTL < ttl {
-		ttl = backendTTL
+	item := backend.Item{
+		Key:     backend.Key(rolesPrefix, role.GetName(), paramsPrefix),
+		Value:   value,
+		Expires: role.Expiry(),
 	}
 
-	err = s.UpsertVal([]string{"roles", role.GetName()}, "params", []byte(data), ttl)
+	_, err = s.Create(context.TODO(), item)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+// UpsertRole updates parameters about role
+func (s *AccessService) UpsertRole(ctx context.Context, role services.Role) error {
+	value, err := services.MarshalRole(role)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	item := backend.Item{
+		Key:     backend.Key(rolesPrefix, role.GetName(), paramsPrefix),
+		Value:   value,
+		Expires: role.Expiry(),
+		ID:      role.GetResourceID(),
+	}
+
+	_, err = s.Put(ctx, item)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -87,23 +106,32 @@ func (s *AccessService) GetRole(name string) (services.Role, error) {
 	if name == "" {
 		return nil, trace.BadParameter("missing role name")
 	}
-	data, err := s.GetVal([]string{"roles", name}, "params")
+	item, err := s.Get(context.TODO(), backend.Key(rolesPrefix, name, paramsPrefix))
 	if err != nil {
 		if trace.IsNotFound(err) {
 			return nil, trace.NotFound("role %v is not found", name)
 		}
 		return nil, trace.Wrap(err)
 	}
-	return services.GetRoleMarshaler().UnmarshalRole(data)
+	return services.UnmarshalRole(item.Value,
+		services.WithResourceID(item.ID), services.WithExpires(item.Expires))
 }
 
-// DeleteRole deletes a role with all the keys from the backend
-func (s *AccessService) DeleteRole(role string) error {
-	err := s.DeleteBucket([]string{"roles"}, role)
+// DeleteRole deletes a role from the backend
+func (s *AccessService) DeleteRole(ctx context.Context, name string) error {
+	if name == "" {
+		return trace.BadParameter("missing role name")
+	}
+	err := s.Delete(ctx, backend.Key(rolesPrefix, name, paramsPrefix))
 	if err != nil {
 		if trace.IsNotFound(err) {
-			return trace.NotFound("role '%v' is not found", role)
+			return trace.NotFound("role %q is not found", name)
 		}
 	}
 	return trace.Wrap(err)
 }
+
+const (
+	rolesPrefix  = "roles"
+	paramsPrefix = "params"
+)

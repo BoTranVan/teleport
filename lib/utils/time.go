@@ -30,13 +30,3 @@ func ToTTL(c clockwork.Clock, tm time.Time) time.Duration {
 	}
 	return tm.Sub(now)
 }
-
-// UTC converts time to UTC timezone
-func UTC(t *time.Time) {
-	if t.IsZero() {
-		// to fix issue with timezones for tests
-		*t = time.Time{}
-		return
-	}
-	*t = t.UTC()
-}

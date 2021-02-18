@@ -18,14 +18,13 @@ package common
 
 import (
 	"io/ioutil"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/utils"
+	log "github.com/sirupsen/logrus"
 
 	"gopkg.in/check.v1"
 )
@@ -42,7 +41,7 @@ type MainTestSuite struct {
 var _ = check.Suite(&MainTestSuite{})
 
 func (s *MainTestSuite) SetUpTest(c *check.C) {
-	utils.InitLoggerForTests()
+	utils.InitLoggerForTests(testing.Verbose())
 }
 
 func (s *MainTestSuite) SetUpSuite(c *check.C) {
@@ -58,7 +57,8 @@ func (s *MainTestSuite) SetUpSuite(c *check.C) {
 		panic(err)
 	}
 	s.configFile = filepath.Join(dirname, "teleport.yaml")
-	ioutil.WriteFile(s.configFile, []byte(YAMLConfig), 770)
+	err = ioutil.WriteFile(s.configFile, []byte(YAMLConfig), 0770)
+	c.Assert(err, check.IsNil)
 
 	// set imprtant defaults to test-mode (non-existing files&locations)
 	defaults.ConfigFilePath = "/tmp/teleport/etc/teleport.yaml"
@@ -66,7 +66,10 @@ func (s *MainTestSuite) SetUpSuite(c *check.C) {
 }
 
 func (s *MainTestSuite) TestDefault(c *check.C) {
-	cmd, conf := Run([]string{"start"}, true)
+	cmd, conf := Run(Options{
+		Args:     []string{"start"},
+		InitOnly: true,
+	})
 	c.Assert(cmd, check.Equals, "start")
 	c.Assert(conf.Hostname, check.Equals, s.hostname)
 	c.Assert(conf.DataDir, check.Equals, "/tmp/teleport/var/lib/teleport")
@@ -74,21 +77,32 @@ func (s *MainTestSuite) TestDefault(c *check.C) {
 	c.Assert(conf.SSH.Enabled, check.Equals, true)
 	c.Assert(conf.Proxy.Enabled, check.Equals, true)
 	c.Assert(conf.Console, check.Equals, os.Stdout)
-	c.Assert(log.GetLevel(), check.Equals, log.WarnLevel)
+	c.Assert(log.GetLevel(), check.Equals, log.ErrorLevel)
 }
 
 func (s *MainTestSuite) TestRolesFlag(c *check.C) {
-	cmd, conf := Run([]string{"start", "--roles=node"}, true)
+	cmd, conf := Run(Options{
+		Args:     []string{"start", "--roles=node"},
+		InitOnly: true,
+	})
 	c.Assert(conf.SSH.Enabled, check.Equals, true)
 	c.Assert(conf.Auth.Enabled, check.Equals, false)
 	c.Assert(conf.Proxy.Enabled, check.Equals, false)
+	c.Assert(cmd, check.Equals, "start")
 
-	cmd, conf = Run([]string{"start", "--roles=proxy"}, true)
+	cmd, conf = Run(Options{
+		Args:     []string{"start", "--roles=proxy"},
+		InitOnly: true,
+	})
 	c.Assert(conf.SSH.Enabled, check.Equals, false)
 	c.Assert(conf.Auth.Enabled, check.Equals, false)
 	c.Assert(conf.Proxy.Enabled, check.Equals, true)
+	c.Assert(cmd, check.Equals, "start")
 
-	cmd, conf = Run([]string{"start", "--roles=auth"}, true)
+	cmd, conf = Run(Options{
+		Args:     []string{"start", "--roles=auth"},
+		InitOnly: true,
+	})
 	c.Assert(conf.SSH.Enabled, check.Equals, false)
 	c.Assert(conf.Auth.Enabled, check.Equals, true)
 	c.Assert(conf.Proxy.Enabled, check.Equals, false)
@@ -96,15 +110,18 @@ func (s *MainTestSuite) TestRolesFlag(c *check.C) {
 }
 
 func (s *MainTestSuite) TestConfigFile(c *check.C) {
-	cmd, conf := Run([]string{"start", "--roles=node", "--labels=a=a1,b=b1", "--config=" + s.configFile}, true)
+	cmd, conf := Run(Options{
+		Args:     []string{"start", "--roles=node", "--labels=a=a1,b=b1", "--config=" + s.configFile},
+		InitOnly: true,
+	})
 	c.Assert(cmd, check.Equals, "start")
 	c.Assert(conf.SSH.Enabled, check.Equals, true)
 	c.Assert(conf.Auth.Enabled, check.Equals, false)
 	c.Assert(conf.Proxy.Enabled, check.Equals, false)
-	c.Assert(log.GetLevel(), check.Equals, log.DebugLevel)
+	c.Assert(conf.Log.GetLevel(), check.Equals, log.DebugLevel)
 	c.Assert(conf.Hostname, check.Equals, "hvostongo.example.org")
 	c.Assert(conf.Token, check.Equals, "xxxyyy")
-	c.Assert(conf.AdvertiseIP, check.DeepEquals, net.ParseIP("10.5.5.5"))
+	c.Assert(conf.AdvertiseIP, check.DeepEquals, "10.5.5.5")
 	c.Assert(conf.SSH.Labels, check.DeepEquals, map[string]string{"a": "a1", "b": "b1"})
 }
 
@@ -138,7 +155,7 @@ ssh_service:
   listen_addr: tcp://ssh
   labels:
     name: mondoserver
-    role: slave
+    role: follower
   commands:
   - name: hostname
     command: [/bin/hostname]

@@ -13,88 +13,52 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+// Package testauthority implements a wrapper around native.Keygen that uses
+// pre-computed keys.
 package testauthority
 
 import (
-	"crypto/rand"
+	"context"
 	random "math/rand"
-	"time"
 
+	"github.com/jonboulle/clockwork"
+
+	"github.com/gravitational/teleport/lib/auth/native"
 	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/utils"
-
-	"golang.org/x/crypto/ssh"
 )
 
 type Keygen struct {
+	clock clockwork.Clock
+	*native.Keygen
 }
 
+// New creates a new key generator with defaults
 func New() *Keygen {
-	return &Keygen{}
+	return NewWithClock(clockwork.NewRealClock())
+}
+
+// NewWithClock creates a new key generator with the specified configuration
+func NewWithClock(clock clockwork.Clock) *Keygen {
+	inner := native.New(context.Background(), native.PrecomputeKeys(0), native.SetClock(clock))
+	return &Keygen{Keygen: inner, clock: clock}
 }
 
 func (n *Keygen) GetNewKeyPairFromPool() ([]byte, []byte, error) {
 	return n.GenerateKeyPair("")
 }
+
 func (n *Keygen) GenerateKeyPair(passphrase string) ([]byte, []byte, error) {
 	randomKey := testPairs[(random.Int() % len(testPairs))]
 	return randomKey.Priv, randomKey.Pub, nil
 }
 
-func (n *Keygen) GenerateHostCert(c services.CertParams) ([]byte, error) {
-	pubKey, _, _, _, err := ssh.ParseAuthorizedKey(c.PublicHostKey)
-	if err != nil {
-		return nil, err
-	}
-	validBefore := uint64(ssh.CertTimeInfinity)
-	if c.TTL != 0 {
-		b := time.Now().Add(c.TTL)
-		validBefore = uint64(b.Unix())
-	}
-	cert := &ssh.Certificate{
-		ValidPrincipals: []string{c.HostID, c.NodeName},
-		Key:             pubKey,
-		ValidBefore:     validBefore,
-		CertType:        ssh.HostCert,
-	}
-	cert.Permissions.Extensions = make(map[string]string)
-	cert.Permissions.Extensions[utils.CertExtensionRole] = c.Roles.String()
-	cert.Permissions.Extensions[utils.CertExtensionAuthority] = c.ClusterName
-	signer, err := ssh.ParsePrivateKey(c.PrivateCASigningKey)
-	if err != nil {
-		return nil, err
-	}
-	if err := cert.SignCert(rand.Reader, signer); err != nil {
-		return nil, err
-	}
-	return ssh.MarshalAuthorizedKey(cert), nil
+func (n *Keygen) GenerateHostCert(c services.HostCertParams) ([]byte, error) {
+	return n.GenerateHostCertWithoutValidation(c)
 }
 
-func (n *Keygen) GenerateUserCert(pkey, key []byte, teleportUsername string, allowedLogins []string, ttl time.Duration, canForwardAgents bool) ([]byte, error) {
-	pubKey, _, _, _, err := ssh.ParseAuthorizedKey(key)
-	if err != nil {
-		return nil, err
-	}
-	validBefore := uint64(ssh.CertTimeInfinity)
-	if ttl != 0 {
-		b := time.Now().Add(ttl)
-		validBefore = uint64(b.Unix())
-	}
-	cert := &ssh.Certificate{
-		KeyId:           teleportUsername,
-		ValidPrincipals: allowedLogins,
-		Key:             pubKey,
-		ValidBefore:     validBefore,
-		CertType:        ssh.UserCert,
-	}
-	signer, err := ssh.ParsePrivateKey(pkey)
-	if err != nil {
-		return nil, err
-	}
-	if err := cert.SignCert(rand.Reader, signer); err != nil {
-		return nil, err
-	}
-	return ssh.MarshalAuthorizedKey(cert), nil
+func (n *Keygen) GenerateUserCert(c services.UserCertParams) ([]byte, error) {
+	return n.GenerateUserCertWithoutValidation(c)
 }
 
 type PreparedKeyPair struct {

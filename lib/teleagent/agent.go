@@ -9,21 +9,47 @@ import (
 
 	"github.com/gravitational/teleport/lib/utils"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/gravitational/trace"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh/agent"
 )
 
+// Agent extends the agent.Agent interface.
+// APIs which accept this interface promise to
+// call `Close()` when they are done using the
+// supplied agent.
+type Agent interface {
+	agent.Agent
+	io.Closer
+}
+
+// nopCloser wraps an agent.Agent in the extended
+// Agent interface by adding a NOP closer.
+type nopCloser struct {
+	agent.Agent
+}
+
+func (n nopCloser) Close() error { return nil }
+
+// NopCloser wraps an agent.Agent with a NOP closer, allowing it
+// to be passed to APIs which expect the extended agent interface.
+func NopCloser(std agent.Agent) Agent {
+	return nopCloser{std}
+}
+
+// Getter is a function used to get an agent instance.
+type Getter func() (Agent, error)
+
 // AgentServer is implementation of SSH agent server
 type AgentServer struct {
-	agent.Agent
+	getAgent Getter
 	listener net.Listener
 	path     string
 }
 
 // NewServer returns new instance of agent server
-func NewServer() *AgentServer {
-	return &AgentServer{Agent: agent.NewKeyring()}
+func NewServer(getter Getter) *AgentServer {
+	return &AgentServer{getAgent: getter}
 }
 
 // ListenUnixSocket starts listening and serving agent assuming that
@@ -59,10 +85,11 @@ func (a *AgentServer) Serve() error {
 				return trace.Wrap(err, "unknown error")
 			}
 			if !neterr.Temporary() {
-				if !strings.Contains(neterr.Error(), "use of closed network connection") {
-					log.Errorf("got permanent error: %v", err)
+				if strings.Contains(neterr.Error(), "use of closed network connection") {
+					return nil
 				}
-				return err
+				log.WithError(err).Error("Got permanent error.")
+				return trace.Wrap(err)
 			}
 			if tempDelay == 0 {
 				tempDelay = 5 * time.Millisecond
@@ -72,15 +99,26 @@ func (a *AgentServer) Serve() error {
 			if max := 1 * time.Second; tempDelay > max {
 				tempDelay = max
 			}
-			log.Errorf("got temp error: %v, will sleep %v", err, tempDelay)
+			log.WithError(err).Errorf("Got temporary error (will sleep %v).", tempDelay)
 			time.Sleep(tempDelay)
 			continue
 		}
 		tempDelay = 0
+
+		// get an agent instance for serving this conn
+		instance, err := a.getAgent()
+		if err != nil {
+			log.WithError(err).Error("Failed to get agent.")
+			return trace.Wrap(err)
+		}
+
+		// serve agent protocol against conn in a
+		// separate goroutine.
 		go func() {
-			if err := agent.ServeAgent(a.Agent, conn); err != nil {
+			defer instance.Close()
+			if err := agent.ServeAgent(instance, conn); err != nil {
 				if err != io.EOF {
-					log.Errorf(err.Error())
+					log.Error(err)
 				}
 			}
 		}()

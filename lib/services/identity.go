@@ -21,25 +21,47 @@ limitations under the License.
 package services
 
 import (
-	"fmt"
-	"strings"
+	"context"
 	"time"
 
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth/u2f"
 	"github.com/gravitational/teleport/lib/defaults"
 
 	"github.com/gokyle/hotp"
 	"github.com/gravitational/trace"
-	"github.com/tstranex/u2f"
+	"github.com/jonboulle/clockwork"
 	"golang.org/x/crypto/ssh"
 )
 
-// Identity is responsible for managing user entries
-type Identity interface {
-	// GetUsers returns a list of users registered with the local auth server
-	GetUsers() ([]User, error)
+// UserGetter is responsible for getting users
+type UserGetter interface {
+	// GetUser returns a user by name
+	GetUser(user string, withSecrets bool) (User, error)
+}
 
+// UsersService is responsible for basic user management
+type UsersService interface {
+	UserGetter
+	// UpdateUser updates an existing user.
+	UpdateUser(ctx context.Context, user User) error
+	// UpsertUser updates parameters about user
+	UpsertUser(user User) error
+	// DeleteUser deletes a user with all the keys from the backend
+	DeleteUser(ctx context.Context, user string) error
+	// GetUsers returns a list of users registered with the local auth server
+	GetUsers(withSecrets bool) ([]User, error)
 	// DeleteAllUsers deletes all users
 	DeleteAllUsers() error
+}
+
+// Identity is responsible for managing user entries and external identities
+type Identity interface {
+	// CreateUser creates user, only if the user entry does not exist
+	CreateUser(user User) error
+
+	// UsersService implements most methods
+	UsersService
 
 	// AddUserLoginAttempt logs user login attempt
 	AddUserLoginAttempt(user string, attempt LoginAttempt, ttl time.Duration) error
@@ -47,21 +69,20 @@ type Identity interface {
 	// GetUserLoginAttempts returns user login attempts
 	GetUserLoginAttempts(user string) ([]LoginAttempt, error)
 
-	// CreateUser creates user if it does not exist
-	CreateUser(user User) error
+	// DeleteUserLoginAttempts removes all login attempts of a user. Should be
+	// called after successful login.
+	DeleteUserLoginAttempts(user string) error
 
-	// UpsertUser updates parameters about user
-	UpsertUser(user User) error
-
-	// GetUser returns a user by name
-	GetUser(user string) (User, error)
-
-	// GetUserByOIDCIdentity returns a user by it's specified OIDC Identity, returns first
+	// GetUserByOIDCIdentity returns a user by its specified OIDC Identity, returns first
 	// user specified with this identity
-	GetUserByOIDCIdentity(id OIDCIdentity) (User, error)
+	GetUserByOIDCIdentity(id ExternalIdentity) (User, error)
 
-	// DeleteUser deletes a user with all the keys from the backend
-	DeleteUser(user string) error
+	// GetUserBySAMLIdentity returns a user by its specified OIDC Identity, returns first
+	// user specified with this identity
+	GetUserBySAMLIdentity(id ExternalIdentity) (User, error)
+
+	// GetUserByGithubIdentity returns a user by its specified Github identity
+	GetUserByGithubIdentity(id ExternalIdentity) (User, error)
 
 	// UpsertPasswordHash upserts user password hash
 	UpsertPasswordHash(user string, hash []byte) error
@@ -77,12 +98,6 @@ type Identity interface {
 	// Deprecated: HOTP use is deprecated, use GetTOTP instead.
 	GetHOTP(user string) (*hotp.HOTP, error)
 
-	// UpsertTOTP upserts TOTP secret key for a user that can be used to generate and validate tokens.
-	UpsertTOTP(user string, secretKey string) error
-
-	// GetTOTP returns the secret key used by the TOTP algorithm to validate tokens.
-	GetTOTP(user string) (string, error)
-
 	// UpsertUsedTOTPToken upserts a TOTP token to the backend so it can't be used again
 	// during the 30 second window it's valid.
 	UpsertUsedTOTPToken(user string, otpToken string) error
@@ -90,33 +105,8 @@ type Identity interface {
 	// GetUsedTOTPToken returns the last successfully used TOTP token.
 	GetUsedTOTPToken(user string) (string, error)
 
-	// DeleteUsedTOTPToken removes the used token from the backend. This should only
-	// be used during tests.
-	DeleteUsedTOTPToken(user string) error
-
-	// UpsertWebSession updates or inserts a web session for a user and session
-	UpsertWebSession(user, sid string, session WebSession) error
-
-	// GetWebSession returns a web session state for a given user and session id
-	GetWebSession(user, sid string) (WebSession, error)
-
-	// DeleteWebSession deletes web session from the storage
-	DeleteWebSession(user, sid string) error
-
 	// UpsertPassword upserts new password and OTP token
 	UpsertPassword(user string, password []byte) error
-
-	// UpsertSignupToken upserts signup token - one time token that lets user to create a user account
-	UpsertSignupToken(token string, tokenData SignupToken, ttl time.Duration) error
-
-	// GetSignupToken returns signup token data
-	GetSignupToken(token string) (*SignupToken, error)
-
-	// GetSignupTokens returns a list of signup tokens
-	GetSignupTokens() ([]SignupToken, error)
-
-	// DeleteSignupToken deletes signup token from the storage
-	DeleteSignupToken(token string) error
 
 	// UpsertU2FRegisterChallenge upserts a U2F challenge for a new user corresponding to the token
 	UpsertU2FRegisterChallenge(token string, u2fChallenge *u2f.Challenge) error
@@ -124,23 +114,20 @@ type Identity interface {
 	// GetU2FRegisterChallenge returns a U2F challenge for a new user corresponding to the token
 	GetU2FRegisterChallenge(token string) (*u2f.Challenge, error)
 
-	// UpsertU2FRegistration upserts a U2F registration from a valid register response
-	UpsertU2FRegistration(user string, u2fReg *u2f.Registration) error
-
-	// GetU2FRegistration returns a U2F registration from a valid register response
-	GetU2FRegistration(user string) (*u2f.Registration, error)
-
 	// UpsertU2FSignChallenge upserts a U2F sign (auth) challenge
-	UpsertU2FSignChallenge(user string, u2fChallenge *u2f.Challenge) error
+	UpsertU2FSignChallenge(user, deviceID string, u2fChallenge *u2f.Challenge) error
 
 	// GetU2FSignChallenge returns a U2F sign (auth) challenge
-	GetU2FSignChallenge(user string) (*u2f.Challenge, error)
+	GetU2FSignChallenge(user, deviceID string) (*u2f.Challenge, error)
 
-	// UpsertU2FRegistrationCounter upserts a counter associated with a U2F registration
-	UpsertU2FRegistrationCounter(user string, counter uint32) error
+	// UpsertMFADevice upserts an MFA device for the user.
+	UpsertMFADevice(ctx context.Context, user string, d *types.MFADevice) error
 
-	// GetU2FRegistrationCounter returns a counter associated with a U2F registration
-	GetU2FRegistrationCounter(user string) (uint32, error)
+	// GetMFADevices gets all MFA devices for the user.
+	GetMFADevices(ctx context.Context, user string) ([]*types.MFADevice, error)
+
+	// DeleteMFADevice deletes an MFA device for the user by ID.
+	DeleteMFADevice(ctx context.Context, user, id string) error
 
 	// UpsertOIDCConnector upserts OIDC Connector
 	UpsertOIDCConnector(connector OIDCConnector) error
@@ -159,6 +146,86 @@ type Identity interface {
 
 	// GetOIDCAuthRequest returns OIDC auth request if found
 	GetOIDCAuthRequest(stateToken string) (*OIDCAuthRequest, error)
+
+	// CreateSAMLConnector creates SAML Connector
+	CreateSAMLConnector(connector SAMLConnector) error
+
+	// UpsertSAMLConnector upserts SAML Connector
+	UpsertSAMLConnector(connector SAMLConnector) error
+
+	// DeleteSAMLConnector deletes OIDC Connector
+	DeleteSAMLConnector(connectorID string) error
+
+	// GetSAMLConnector returns OIDC connector data, withSecrets adds or removes secrets from return results
+	GetSAMLConnector(id string, withSecrets bool) (SAMLConnector, error)
+
+	// GetSAMLConnectors returns registered connectors, withSecrets adds or removes secret from return results
+	GetSAMLConnectors(withSecrets bool) ([]SAMLConnector, error)
+
+	// CreateSAMLAuthRequest creates new auth request
+	CreateSAMLAuthRequest(req SAMLAuthRequest, ttl time.Duration) error
+
+	// GetSAMLAuthRequest returns OSAML auth request if found
+	GetSAMLAuthRequest(id string) (*SAMLAuthRequest, error)
+
+	// CreateGithubConnector creates a new Github connector
+	CreateGithubConnector(connector GithubConnector) error
+
+	// UpsertGithubConnector creates or updates a new Github connector
+	UpsertGithubConnector(connector GithubConnector) error
+
+	// GetGithubConnectors returns all configured Github connectors
+	GetGithubConnectors(withSecrets bool) ([]GithubConnector, error)
+
+	// GetGithubConnector returns a Github connector by its name
+	GetGithubConnector(name string, withSecrets bool) (GithubConnector, error)
+
+	// DeleteGithubConnector deletes a Github connector by its name
+	DeleteGithubConnector(name string) error
+
+	// CreateGithubAuthRequest creates a new auth request for Github OAuth2 flow
+	CreateGithubAuthRequest(req GithubAuthRequest) error
+
+	// GetGithubAuthRequest retrieves Github auth request by the token
+	GetGithubAuthRequest(stateToken string) (*GithubAuthRequest, error)
+
+	// CreateResetPasswordToken creates a token
+	CreateResetPasswordToken(ctx context.Context, resetPasswordToken ResetPasswordToken) (ResetPasswordToken, error)
+
+	// DeleteResetPasswordToken deletes a token
+	DeleteResetPasswordToken(ctx context.Context, tokenID string) error
+
+	// GetResetPasswordTokens returns tokens
+	GetResetPasswordTokens(ctx context.Context) ([]ResetPasswordToken, error)
+
+	// GetResetPasswordToken returns a token
+	GetResetPasswordToken(ctx context.Context, tokenID string) (ResetPasswordToken, error)
+
+	// UpsertResetPasswordTokenSecrets upserts token secrets
+	UpsertResetPasswordTokenSecrets(ctx context.Context, secrets ResetPasswordTokenSecrets) error
+
+	// GetResetPasswordTokenSecrets returns token secrets
+	GetResetPasswordTokenSecrets(ctx context.Context, tokenID string) (ResetPasswordTokenSecrets, error)
+
+	types.WebSessionsGetter
+	types.WebTokensGetter
+
+	// AppSession defines application session features.
+	AppSession
+}
+
+// AppSession defines application session features.
+type AppSession interface {
+	// GetAppSession gets an application web session.
+	GetAppSession(context.Context, GetAppSessionRequest) (WebSession, error)
+	// GetAppSessions gets all application web sessions.
+	GetAppSessions(context.Context) ([]WebSession, error)
+	// UpsertAppSession upserts and application web session.
+	UpsertAppSession(context.Context, WebSession) error
+	// DeleteAppSession removes an application web session.
+	DeleteAppSession(context.Context, DeleteAppSessionRequest) error
+	// DeleteAllAppSessions removes all application web sessions.
+	DeleteAllAppSessions(context.Context) error
 }
 
 // VerifyPassword makes sure password satisfies our requirements (relaxed),
@@ -175,54 +242,73 @@ func VerifyPassword(password []byte) error {
 	return nil
 }
 
-// SignupToken stores metadata about user signup token
-// is stored and generated when tctl add user is executed
-type SignupToken struct {
-	Token     string    `json:"token"`
-	User      UserV1    `json:"user"`
-	OTPKey    string    `json:"otp_key"`
-	OTPQRCode []byte    `json:"otp_qr_code"`
-	Expires   time.Time `json:"expires"`
-}
-
-// OIDCIdentity is OpenID Connect identity that is linked
-// to particular user and connector and lets user to log in using external
-// credentials, e.g. google
-type OIDCIdentity struct {
-	// ConnectorID is id of registered OIDC connector, e.g. 'google-example.com'
+// GithubAuthRequest is the request to start Github OAuth2 flow
+type GithubAuthRequest struct {
+	// ConnectorID is the name of the connector to use
 	ConnectorID string `json:"connector_id"`
-
-	// Email is OIDC verified email claim
-	// e.g. bob@example.com
-	Email string `json:"username"`
+	// Type is opaque string that helps callbacks identify the request type
+	Type string `json:"type"`
+	// StateToken is used to validate the request
+	StateToken string `json:"state_token"`
+	// CSRFToken is used to protect against CSRF attacks
+	CSRFToken string `json:"csrf_token"`
+	// PublicKey is an optional public key to sign in case of successful auth
+	PublicKey []byte `json:"public_key"`
+	// CertTTL is TTL of the cert that's generated in case of successful auth
+	CertTTL time.Duration `json:"cert_ttl"`
+	// CreateWebSession indicates that a user wants to generate a web session
+	// after successul authentication
+	CreateWebSession bool `json:"create_web_session"`
+	// RedirectURL will be used by browser
+	RedirectURL string `json:"redirect_url"`
+	// ClientRedirectURL is the URL where client will be redirected after
+	// successful auth
+	ClientRedirectURL string `json:"client_redirect_url"`
+	// Compatibility specifies OpenSSH compatibility flags
+	Compatibility string `json:"compatibility,omitempty"`
+	// Expires is a global expiry time header can be set on any resource in the system.
+	Expires *time.Time `json:"expires,omitempty"`
+	// RouteToCluster is the name of Teleport cluster to issue credentials for.
+	RouteToCluster string `json:"route_to_cluster,omitempty"`
+	// KubernetesCluster is the name of Kubernetes cluster to issue credentials for.
+	KubernetesCluster string `json:"kubernetes_cluster,omitempty"`
 }
 
-const OIDCIDentitySchema = `{
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-     "connector_id": {"type": "string"}, 
-     "username": {"type": "string"} 
-   }
-}`
-
-// String returns debug friendly representation of this identity
-func (i *OIDCIdentity) String() string {
-	return fmt.Sprintf("OIDCIdentity(connectorID=%v, email=%v)", i.ConnectorID, i.Email)
+// SetTTL sets Expires header using realtime clock
+func (r *GithubAuthRequest) SetTTL(clock clockwork.Clock, ttl time.Duration) {
+	expireTime := clock.Now().UTC().Add(ttl)
+	r.Expires = &expireTime
 }
 
-// Equals returns true if this identity equals to passed one
-func (i *OIDCIdentity) Equals(other *OIDCIdentity) bool {
-	return i.ConnectorID == other.ConnectorID && i.Email == other.Email
+// SetExpiry sets expiry time for the object
+func (r *GithubAuthRequest) SetExpiry(expires time.Time) {
+	r.Expires = &expires
 }
 
-// Check returns nil if all parameters are great, err otherwise
-func (i *OIDCIdentity) Check() error {
-	if i.ConnectorID == "" {
-		return trace.BadParameter("ConnectorID: missing value")
+// Expiry returns object expiry setting.
+func (r *GithubAuthRequest) Expiry() time.Time {
+	if r.Expires == nil {
+		return time.Time{}
 	}
-	if i.Email == "" {
-		return trace.BadParameter("Email: missing email")
+	return *r.Expires
+}
+
+// Check makes sure the request is valid
+func (r *GithubAuthRequest) Check() error {
+	if r.ConnectorID == "" {
+		return trace.BadParameter("missing ConnectorID")
+	}
+	if r.StateToken == "" {
+		return trace.BadParameter("missing StateToken")
+	}
+	if len(r.PublicKey) != 0 {
+		_, _, _, _, err := ssh.ParseAuthorizedKey(r.PublicKey)
+		if err != nil {
+			return trace.BadParameter("bad PublicKey: %v", err)
+		}
+		if (r.CertTTL > defaults.MaxCertDuration) || (r.CertTTL < defaults.MinCertDuration) {
+			return trace.BadParameter("wrong CertTTL")
+		}
 	}
 	return nil
 }
@@ -243,12 +329,15 @@ type OIDCAuthRequest struct {
 	// reuqest coming from
 	StateToken string `json:"state_token"`
 
+	// CSRFToken is associated with user web session token
+	CSRFToken string `json:"csrf_token"`
+
 	// RedirectURL will be used by browser
 	RedirectURL string `json:"redirect_url"`
 
 	// PublicKey is an optional public key, users want these
 	// keys to be signed by auth servers user CA in case
-	// of successfull auth
+	// of successful auth
 	PublicKey []byte `json:"public_key"`
 
 	// CertTTL is the TTL of the certificate user wants to get
@@ -259,8 +348,17 @@ type OIDCAuthRequest struct {
 	CreateWebSession bool `json:"create_web_session"`
 
 	// ClientRedirectURL is a URL client wants to be redirected
-	// after successfull authentication
+	// after successful authentication
 	ClientRedirectURL string `json:"client_redirect_url"`
+
+	// Compatibility specifies OpenSSH compatibility flags.
+	Compatibility string `json:"compatibility,omitempty"`
+
+	// RouteToCluster is the name of Teleport cluster to issue credentials for.
+	RouteToCluster string `json:"route_to_cluster,omitempty"`
+
+	// KubernetesCluster is the name of Kubernetes cluster to issue credentials for.
+	KubernetesCluster string `json:"kubernetes_cluster,omitempty"`
 }
 
 // Check returns nil if all parameters are great, err otherwise
@@ -284,32 +382,68 @@ func (i *OIDCAuthRequest) Check() error {
 	return nil
 }
 
-// U2F is a configuration of the U2F two factor authentication
-// Deprecated: Use services.UniversalSecondFactor instead.
-type U2F struct {
-	Enabled bool
-	// AppID identifies the website to the U2F keys. It should not be changed once a U2F
-	// key is registered or all existing registrations will become invalid.
-	AppID string
-	// Facets should include the domain name of all proxies.
-	Facets []string
+// SAMLAuthRequest is a request to authenticate with OIDC
+// provider, the state about request is managed by auth server
+type SAMLAuthRequest struct {
+	// ID is a unique request ID
+	ID string `json:"id"`
+
+	// ConnectorID is ID of OIDC connector this request uses
+	ConnectorID string `json:"connector_id"`
+
+	// Type is opaque string that helps callbacks identify the request type
+	Type string `json:"type"`
+
+	// CheckUser tells validator if it should expect and check user
+	CheckUser bool `json:"check_user"`
+
+	// RedirectURL will be used by browser
+	RedirectURL string `json:"redirect_url"`
+
+	// PublicKey is an optional public key, users want these
+	// keys to be signed by auth servers user CA in case
+	// of successful auth
+	PublicKey []byte `json:"public_key"`
+
+	// CertTTL is the TTL of the certificate user wants to get
+	CertTTL time.Duration `json:"cert_ttl"`
+
+	// CSRFToken is associated with user web session token
+	CSRFToken string `json:"csrf_token"`
+
+	// CreateWebSession indicates if user wants to generate a web
+	// session after successful authentication
+	CreateWebSession bool `json:"create_web_session"`
+
+	// ClientRedirectURL is a URL client wants to be redirected
+	// after successful authentication
+	ClientRedirectURL string `json:"client_redirect_url"`
+
+	// Compatibility specifies OpenSSH compatibility flags.
+	Compatibility string `json:"compatibility,omitempty"`
+
+	// RouteToCluster is the name of Teleport cluster to issue credentials for.
+	RouteToCluster string `json:"route_to_cluster,omitempty"`
+
+	// KubernetesCluster is the name of Kubernetes cluster to issue credentials for.
+	KubernetesCluster string `json:"kubernetes_cluster,omitempty"`
 }
 
-func (u *U2F) Check() error {
-	if u.Enabled {
-		// Basic verification of the U2F config
-		if !strings.HasPrefix(u.AppID, "https://") {
-			return trace.BadParameter("U2F: invalid AppID: %s", u.AppID)
+// Check returns nil if all parameters are great, err otherwise
+func (i *SAMLAuthRequest) Check() error {
+	if i.ConnectorID == "" {
+		return trace.BadParameter("ConnectorID: missing value")
+	}
+	if len(i.PublicKey) != 0 {
+		_, _, _, _, err := ssh.ParseAuthorizedKey(i.PublicKey)
+		if err != nil {
+			return trace.BadParameter("PublicKey: bad key: %v", err)
 		}
-		if len(u.Facets) == 0 {
-			return trace.BadParameter("U2F: no Facets specified")
-		}
-		for i := range u.Facets {
-			if !strings.HasPrefix(u.Facets[i], "https://") {
-				return trace.BadParameter("U2F: invalid Facet: %s", u.Facets[i])
-			}
+		if (i.CertTTL > defaults.MaxCertDuration) || (i.CertTTL < defaults.MinCertDuration) {
+			return trace.BadParameter("CertTTL: wrong certificate TTL")
 		}
 	}
+
 	return nil
 }
 

@@ -17,16 +17,17 @@ limitations under the License.
 package session
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/gravitational/teleport/lib/backend"
-	"github.com/gravitational/teleport/lib/backend/dir"
+	"github.com/gravitational/teleport/lib/backend/lite"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/utils"
-	"github.com/jonboulle/clockwork"
 
 	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
 	. "gopkg.in/check.v1"
 )
 
@@ -35,26 +36,32 @@ func TestSessions(t *testing.T) { TestingT(t) }
 type SessionSuite struct {
 	dir   string
 	srv   *server
-	bk    *dir.Backend
+	bk    backend.Backend
 	clock clockwork.FakeClock
 }
 
 var _ = Suite(&SessionSuite{})
 
 func (s *SessionSuite) SetUpSuite(c *C) {
-	utils.InitLoggerForTests()
+	utils.InitLoggerForTests(testing.Verbose())
 }
 
 func (s *SessionSuite) SetUpTest(c *C) {
+	var err error
+
 	s.clock = clockwork.NewFakeClockAt(time.Date(2016, 9, 8, 7, 6, 5, 0, time.UTC))
 	s.dir = c.MkDir()
 
-	bk, err := dir.New(backend.Params{"path": s.dir})
+	s.bk, err = lite.NewWithConfig(context.TODO(),
+		lite.Config{
+			Path:  s.dir,
+			Clock: s.clock,
+		},
+	)
 	c.Assert(err, IsNil)
-	s.bk = bk.(*dir.Backend)
-	s.bk.InternalClock = s.clock
 
 	srv, err := New(s.bk)
+	srv.(*server).clock = s.clock
 	s.srv = srv.(*server)
 	c.Assert(err, IsNil)
 }
@@ -80,10 +87,10 @@ func (s *SessionSuite) TestSessionsCRUD(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(len(out), Equals, 0)
 
+	// Create session.
 	sess := Session{
 		ID:             NewID(),
 		Namespace:      defaults.Namespace,
-		Active:         true,
 		TerminalParams: TerminalParams{W: 100, H: 100},
 		Login:          "bob",
 		LastActive:     s.clock.Now().UTC(),
@@ -91,24 +98,13 @@ func (s *SessionSuite) TestSessionsCRUD(c *C) {
 	}
 	c.Assert(s.srv.CreateSession(sess), IsNil)
 
+	// Make sure only one session exists.
 	out, err = s.srv.GetSessions(defaults.Namespace)
 	c.Assert(err, IsNil)
 	c.Assert(out, DeepEquals, []Session{sess})
 
+	// Make sure the session is the one created above.
 	s2, err := s.srv.GetSession(defaults.Namespace, sess.ID)
-	c.Assert(err, IsNil)
-	c.Assert(s2, DeepEquals, &sess)
-
-	// Mark session inactive
-	err = s.srv.UpdateSession(UpdateRequest{
-		ID:        sess.ID,
-		Namespace: defaults.Namespace,
-		Active:    Bool(false),
-	})
-	c.Assert(err, IsNil)
-
-	sess.Active = false
-	s2, err = s.srv.GetSession(defaults.Namespace, sess.ID)
 	c.Assert(err, IsNil)
 	c.Assert(s2, DeepEquals, &sess)
 
@@ -120,10 +116,19 @@ func (s *SessionSuite) TestSessionsCRUD(c *C) {
 	})
 	c.Assert(err, IsNil)
 
+	// Verify update was applied.
 	sess.TerminalParams = TerminalParams{W: 101, H: 101}
 	s2, err = s.srv.GetSession(defaults.Namespace, sess.ID)
 	c.Assert(err, IsNil)
 	c.Assert(s2, DeepEquals, &sess)
+
+	// Remove the session.
+	err = s.srv.DeleteSession(defaults.Namespace, sess.ID)
+	c.Assert(err, IsNil)
+
+	// Make sure session no longer exists.
+	_, err = s.srv.GetSession(defaults.Namespace, sess.ID)
+	c.Assert(err, NotNil)
 }
 
 // TestSessionsInactivity makes sure that session will be marked
@@ -132,7 +137,6 @@ func (s *SessionSuite) TestSessionsInactivity(c *C) {
 	sess := Session{
 		ID:             NewID(),
 		Namespace:      defaults.Namespace,
-		Active:         true,
 		TerminalParams: TerminalParams{W: 100, H: 100},
 		Login:          "bob",
 		LastActive:     s.clock.Now().UTC(),
@@ -155,7 +159,6 @@ func (s *SessionSuite) TestPartiesCRUD(c *C) {
 	sess := Session{
 		ID:             NewID(),
 		Namespace:      defaults.Namespace,
-		Active:         true,
 		TerminalParams: TerminalParams{W: 100, H: 100},
 		Login:          "vincent",
 		LastActive:     s.clock.Now().UTC(),
@@ -179,26 +182,28 @@ func (s *SessionSuite) TestPartiesCRUD(c *C) {
 			LastActive: s.clock.Now().UTC(),
 		},
 	}
-	s.srv.UpdateSession(UpdateRequest{
+	err := s.srv.UpdateSession(UpdateRequest{
 		ID:        sess.ID,
 		Namespace: defaults.Namespace,
 		Parties:   &parties,
 	})
+	c.Assert(err, IsNil)
 	// verify they're in the session:
 	copy, err := s.srv.GetSession(defaults.Namespace, sess.ID)
 	c.Assert(err, IsNil)
 	c.Assert(len(copy.Parties), Equals, 2)
 
 	// empty update (list of parties must not change)
-	s.srv.UpdateSession(UpdateRequest{ID: sess.ID, Namespace: defaults.Namespace})
+	err = s.srv.UpdateSession(UpdateRequest{ID: sess.ID, Namespace: defaults.Namespace})
+	c.Assert(err, IsNil)
 	copy, _ = s.srv.GetSession(defaults.Namespace, sess.ID)
 	c.Assert(len(copy.Parties), Equals, 2)
 
 	// remove the 2nd party:
 	deleted := copy.RemoveParty(parties[1].ID)
 	c.Assert(deleted, Equals, true)
-	s.srv.UpdateSession(UpdateRequest{ID: copy.ID,
-		Parties: &copy.Parties, Namespace: defaults.Namespace})
+	err = s.srv.UpdateSession(UpdateRequest{ID: copy.ID, Parties: &copy.Parties, Namespace: defaults.Namespace})
+	c.Assert(err, IsNil)
 	copy, _ = s.srv.GetSession(defaults.Namespace, sess.ID)
 	c.Assert(len(copy.Parties), Equals, 1)
 

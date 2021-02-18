@@ -1,5 +1,5 @@
 /*
-Copyright 2016 Gravitational, Inc.
+Copyright 2016-2019 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,50 +18,113 @@ limitations under the License.
 package client
 
 import (
+	"io/ioutil"
 	"os"
-	"path"
+	"path/filepath"
+	"testing"
 
-	"gopkg.in/check.v1"
+	"github.com/gravitational/trace"
+
+	"github.com/stretchr/testify/require"
 )
 
-type ProfileTestSuite struct {
-}
+// TestProfileBasics verifies basic profile operations such as
+// load/store and setting current.
+func TestProfileBasics(t *testing.T) {
+	t.Parallel()
 
-var _ = check.Suite(&ProfileTestSuite{})
+	dir, err := ioutil.TempDir("", "teleport")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
 
-func (s *ProfileTestSuite) TestEverything(c *check.C) {
-	p := &ClientProfile{
-		ProxyHost:      "proxy",
-		ProxySSHPort:   3023,
-		ProxyWebPort:   3088,
-		Username:       "testuser",
-		ForwardedPorts: []string{"8000:example.com:8000"},
+	p := &Profile{
+		WebProxyAddr:          "proxy:3088",
+		SSHProxyAddr:          "proxy:3023",
+		Username:              "testuser",
+		ForwardedPorts:        []string{"8000:example.com:8000"},
+		DynamicForwardedPorts: []string{"localhost:8080"},
 	}
 
-	home := c.MkDir()
-	pfile := path.Join(home, "test.yaml")
+	// verify that profile name is proxy host component
+	require.Equal(t, "proxy", p.Name())
 
 	// save to a file:
-	err := p.SaveTo(pfile, 0)
-	c.Assert(err, check.IsNil)
+	err = p.SaveToDir(dir, false)
+	require.NoError(t, err)
+
+	// verify that the resulting file exists and is of the form `<profile-dir>/<profile-name>.yaml`.
+	_, err = os.Stat(filepath.Join(dir, p.Name()+".yaml"))
+	require.NoError(t, err)
 
 	// try to save to non-existent dir, should get an error
-	err = p.SaveTo("/bad/directory/profile.yaml", 0)
-	c.Assert(err, check.NotNil)
+	err = p.SaveToDir("/bad/directory/", false)
+	require.Error(t, err)
 
-	// make sure there is no symlink:
-	symlink := path.Join(home, CurrentProfileSymlink)
-	_, err = os.Stat(symlink)
-	c.Assert(os.IsNotExist(err), check.Equals, true)
+	// make sure current profile was not set
+	_, err = GetCurrentProfileName(dir)
+	require.True(t, trace.IsNotFound(err))
 
-	// save again, this time with a symlink:
-	p.SaveTo(pfile, ProfileMakeCurrent)
-	stat, err := os.Stat(symlink)
-	c.Assert(err, check.IsNil)
-	c.Assert(stat.Size() > 10, check.Equals, true)
+	// save again, this time also making current
+	err = p.SaveToDir(dir, true)
+	require.NoError(t, err)
 
-	// load and verify:
-	clone, err := ProfileFromDir(home)
-	c.Assert(err, check.IsNil)
-	c.Assert(*clone, check.DeepEquals, *p)
+	// verify that current profile is set and matches this profile
+	name, err := GetCurrentProfileName(dir)
+	require.NoError(t, err)
+	require.Equal(t, p.Name(), name)
+
+	// load and verify current profile
+	clone, err := ProfileFromDir(dir, "")
+	require.NoError(t, err)
+	require.Equal(t, *p, *clone)
+
+	// load and verify directly
+	clone, err = ProfileFromDir(dir, p.Name())
+	require.NoError(t, err)
+	require.Equal(t, *p, *clone)
+}
+
+// TestProfileSymlinkMigration verifies that the old `profile` symlink
+// is correctly migrated to the new `current-profile` file.
+//
+// DELETE IN: 6.0
+func TestProfileSymlinkMigration(t *testing.T) {
+	t.Parallel()
+
+	dir, err := ioutil.TempDir("", "teleport")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	name := "some-profile"
+	file := filepath.Join(dir, name+".yaml")
+	link := filepath.Join(dir, CurrentProfileSymlink)
+
+	// note that we don't bother to create the actual profile; this
+	// migration deals solely with converting the `profile` symlink
+	// to a `current-profile` file.
+
+	// create old style symlink
+	require.NoError(t, os.Symlink(file, link))
+
+	// ensure that link exists
+	_, err = os.Lstat(link)
+	require.NoError(t, err)
+
+	// load current profile name; this should automatically
+	// trigger the migration and return the correct name.
+	cn, err := GetCurrentProfileName(dir)
+	require.NoError(t, err)
+	require.Equal(t, name, cn)
+
+	// verify that current-profile file now exists
+	_, err = os.Stat(filepath.Join(dir, CurrentProfileFilename))
+	require.NoError(t, err)
+
+	// forcibly remove the symlink
+	require.NoError(t, os.Remove(link))
+
+	// loading current profile should still succeed.
+	cn, err = GetCurrentProfileName(dir)
+	require.NoError(t, err)
+	require.Equal(t, name, cn)
 }

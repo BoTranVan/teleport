@@ -23,8 +23,8 @@ import (
 	"strconv"
 	"strings"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/gravitational/trace"
+	log "github.com/sirupsen/logrus"
 )
 
 // NetAddr is network address that includes network, optional path and
@@ -36,6 +36,38 @@ type NetAddr struct {
 	AddrNetwork string `json:"network,omitempty"`
 	// Path is a socket file path, like '/var/path/to/socket' in "unix:///var/path/to/socket"
 	Path string `json:"path,omitempty"`
+}
+
+// Host returns host part of address without port
+func (a *NetAddr) Host() string {
+	host, _, err := net.SplitHostPort(a.Addr)
+	if err == nil {
+		return host
+	}
+	// this is done to remove optional square brackets
+	if ip := net.ParseIP(strings.Trim(a.Addr, "[]")); len(ip) != 0 {
+		return ip.String()
+	}
+	return a.Addr
+}
+
+// Port returns defaultPort if no port is set or is invalid,
+// the real port otherwise
+func (a *NetAddr) Port(defaultPort int) int {
+	_, port, err := net.SplitHostPort(a.Addr)
+	if err != nil {
+		return defaultPort
+	}
+	porti, err := strconv.Atoi(port)
+	if err != nil {
+		return defaultPort
+	}
+	return porti
+}
+
+// Equals returns true if address is equal to other
+func (a *NetAddr) Equals(other NetAddr) bool {
+	return a.Addr == other.Addr && a.AddrNetwork == other.AddrNetwork && a.Path == other.Path
 }
 
 // IsLocal returns true if this is a local address
@@ -54,7 +86,7 @@ func (a *NetAddr) IsLoopback() bool {
 
 // IsEmpty returns true if address is empty
 func (a *NetAddr) IsEmpty() bool {
-	return a.Addr == "" && a.AddrNetwork == "" && a.Path == ""
+	return a == nil || (a.Addr == "" && a.AddrNetwork == "" && a.Path == "")
 }
 
 // FullAddress returns full address including network and address (tcp://0.0.0.0:1243)
@@ -98,32 +130,54 @@ func (a *NetAddr) UnmarshalYAML(unmarshal func(interface{}) error) error {
 func (a *NetAddr) Set(s string) error {
 	v, err := ParseAddr(s)
 	if err != nil {
-		return err
+		return trace.Wrap(err)
 	}
 	a.Addr = v.Addr
 	a.AddrNetwork = v.AddrNetwork
 	return nil
 }
 
+// NetAddrsToStrings takes a list of netAddrs and returns a list of address strings.
+func NetAddrsToStrings(netAddrs []NetAddr) []string {
+	addrs := make([]string, len(netAddrs))
+	for i, addr := range netAddrs {
+		addrs[i] = addr.String()
+	}
+	return addrs
+}
+
+// ParseAddrs parses the provided slice of strings as a slice of NetAddr's.
+func ParseAddrs(addrs []string) (result []NetAddr, err error) {
+	for _, addr := range addrs {
+		parsed, err := ParseAddr(addr)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		result = append(result, *parsed)
+	}
+	return result, nil
+}
+
 // ParseAddr takes strings like "tcp://host:port/path" and returns
 // *NetAddr or an error
 func ParseAddr(a string) (*NetAddr, error) {
+	if a == "" {
+		return nil, trace.BadParameter("missing parameter address")
+	}
 	if !strings.Contains(a, "://") {
-		host, port, err := net.SplitHostPort(a)
-		if err != nil {
-			return nil, trace.BadParameter("invalid network address: '%v', expecting host:port", a)
-		}
-		return &NetAddr{Addr: fmt.Sprintf("%v:%v", host, port), AddrNetwork: "tcp"}, nil
+		return &NetAddr{Addr: a, AddrNetwork: "tcp"}, nil
 	}
 	u, err := url.Parse(a)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse '%v':%v", a, err)
+		return nil, trace.BadParameter("failed to parse %q: %v", a, err)
 	}
 	switch u.Scheme {
 	case "tcp":
 		return &NetAddr{Addr: u.Host, AddrNetwork: u.Scheme, Path: u.Path}, nil
 	case "unix":
 		return &NetAddr{Addr: u.Path, AddrNetwork: u.Scheme}, nil
+	case "http", "https":
+		return &NetAddr{Addr: u.Host, AddrNetwork: u.Scheme, Path: u.Path}, nil
 	default:
 		return nil, trace.BadParameter("'%v': unsupported scheme: '%v'", a, u.Scheme)
 	}
@@ -138,81 +192,54 @@ func MustParseAddr(a string) *NetAddr {
 	return addr
 }
 
+// MustParseAddrList parses the provided list of strings into a NetAddr list or panics on error
+func MustParseAddrList(aList ...string) []NetAddr {
+	addrList := make([]NetAddr, len(aList))
+	for i, a := range aList {
+		addrList[i] = *MustParseAddr(a)
+	}
+	return addrList
+}
+
+// FromAddr returns NetAddr from golang standard net.Addr
+func FromAddr(a net.Addr) NetAddr {
+	return NetAddr{AddrNetwork: a.Network(), Addr: a.String()}
+}
+
+// JoinAddrSlices joins two addr slices and returns a resulting slice
+func JoinAddrSlices(a []NetAddr, b []NetAddr) []NetAddr {
+	if len(a)+len(b) == 0 {
+		return nil
+	}
+	out := make([]NetAddr, 0, len(a)+len(b))
+	out = append(out, a...)
+	out = append(out, b...)
+	return out
+}
+
 // ParseHostPortAddr takes strings like "host:port" and returns
 // *NetAddr or an error
 //
 // If defaultPort == -1 it expects 'hostport' string to have it
 func ParseHostPortAddr(hostport string, defaultPort int) (*NetAddr, error) {
-	host, port, err := net.SplitHostPort(hostport)
+	addr, err := ParseAddr(hostport)
 	if err != nil {
-		if defaultPort > 0 {
-			host, port, err = net.SplitHostPort(
-				net.JoinHostPort(hostport, strconv.Itoa(defaultPort)))
-		}
-		if err != nil {
-			return nil, trace.Errorf("failed to parse '%v': %v", hostport, err)
-		}
+		return nil, trace.Wrap(err)
 	}
-	return ParseAddr(fmt.Sprintf("tcp://%s", net.JoinHostPort(host, port)))
-}
-
-func NewNetAddrVal(defaultVal NetAddr, val *NetAddr) *NetAddrVal {
-	*val = defaultVal
-	return (*NetAddrVal)(val)
-}
-
-// NetAddrVal can be used with flag package
-type NetAddrVal NetAddr
-
-func (a *NetAddrVal) Set(s string) error {
-	v, err := ParseAddr(s)
-	if err != nil {
-		return err
+	// port is required but not set
+	if defaultPort == -1 && addr.Addr == addr.Host() {
+		return nil, trace.BadParameter("missing port in address %q", hostport)
 	}
-	a.Addr = v.Addr
-	a.AddrNetwork = v.AddrNetwork
-	return nil
+	addr.Addr = net.JoinHostPort(addr.Host(), fmt.Sprintf("%v", addr.Port(defaultPort)))
+	return addr, nil
 }
 
-func (a *NetAddrVal) String() string {
-	return ((*NetAddr)(a)).FullAddress()
-}
-
-func (a *NetAddrVal) Get() interface{} {
-	return NetAddr(*a)
-}
-
-// NetAddrList is a list of NetAddrs that supports
-// helper methods for parsing from CLI tools
-type NetAddrList []NetAddr
-
-// Addresses returns a slice of strings converted from the addresses
-func (nl *NetAddrList) Addresses() []string {
-	var ns []string
-	for _, n := range *nl {
-		ns = append(ns, n.FullAddress())
+// DialAddrFromListenAddr returns dial address from listen address
+func DialAddrFromListenAddr(listenAddr NetAddr) NetAddr {
+	if listenAddr.IsEmpty() {
+		return listenAddr
 	}
-	return ns
-}
-
-// Set is called by CLI tools
-func (nl *NetAddrList) Set(s string) error {
-	v, err := ParseAddr(s)
-	if err != nil {
-		return err
-	}
-
-	*nl = append(*nl, *v)
-	return nil
-}
-
-// String returns debug-friendly representation of the tool
-func (nl *NetAddrList) String() string {
-	var ns []string
-	for _, n := range *nl {
-		ns = append(ns, n.FullAddress())
-	}
-	return strings.Join(ns, " ")
+	return NetAddr{Addr: ReplaceLocalhost(listenAddr.Addr, "127.0.0.1")}
 }
 
 // ReplaceLocalhost checks if a given address is link-local (like 0.0.0.0 or 127.0.0.1)
@@ -309,19 +336,22 @@ func guessHostIP(addrs []net.Addr) (ip net.IP) {
 		}
 		ips = append(ips, ipAddr)
 	}
+
 	for i := range ips {
-		switch ips[i][12] {
-		// our first pick would be "10.x.x.x" IPs:
-		case 10:
-			return ips[i]
-			// our 2nd pick would be "192.x.x.x"
-		case 192:
+		first := &net.IPNet{IP: net.IPv4(10, 0, 0, 0), Mask: net.CIDRMask(8, 32)}
+		second := &net.IPNet{IP: net.IPv4(192, 168, 0, 0), Mask: net.CIDRMask(16, 32)}
+		third := &net.IPNet{IP: net.IPv4(172, 16, 0, 0), Mask: net.CIDRMask(12, 32)}
+
+		// our first pick would be "10.0.0.0/8"
+		if first.Contains(ips[i]) {
 			ip = ips[i]
-			// our 3rd pick would be "172.x.x.x"
-		case 172:
-			if ip == nil {
-				ip = ips[i]
-			}
+			break
+			// our 2nd pick would be "192.168.0.0/16"
+		} else if second.Contains(ips[i]) {
+			ip = ips[i]
+			// our 3rd pick would be "172.16.0.0/12"
+		} else if third.Contains(ips[i]) && !second.Contains(ip) {
+			ip = ips[i]
 		}
 	}
 	if ip == nil {

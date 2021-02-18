@@ -13,15 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package config
 
 import (
 	"encoding/base64"
-	"fmt"
-	"time"
-
-	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/services"
 
 	"gopkg.in/check.v1"
 )
@@ -30,7 +26,6 @@ type FileTestSuite struct {
 }
 
 var _ = check.Suite(&FileTestSuite{})
-var _ = fmt.Printf
 
 func (s *FileTestSuite) SetUpSuite(c *check.C) {
 }
@@ -95,123 +90,6 @@ auth_service:
 				},
 			},
 		},
-		// 3 - oidc without second factor
-		{
-			`
-auth_service:
-  authentication:
-    type: oidc
-    oidc:
-      id: google
-      redirect_url: "https://localhost:3080/v1/webapi/oidc/callback"
-      client_id: id-from-google.apps.googleusercontent.com
-      client_secret: secret-key-from-google
-      issuer_url: "https://accounts.google.com"
-      display: whaterver
-      scope: [ "ssh_permissions", "roles"]
-      claims_to_roles:
-        - claim: role
-          value: admin
-          roles: ["dba", "backup", "root"]
-`,
-			&AuthenticationConfig{
-				Type: "oidc",
-				OIDC: &OIDCConnector{
-					ID:           "google",
-					RedirectURL:  "https://localhost:3080/v1/webapi/oidc/callback",
-					ClientID:     "id-from-google.apps.googleusercontent.com",
-					ClientSecret: "secret-key-from-google",
-					IssuerURL:    "https://accounts.google.com",
-					Display:      "whaterver",
-					Scope: []string{
-						"ssh_permissions",
-						"roles",
-					},
-					ClaimsToRoles: []ClaimMapping{
-						ClaimMapping{
-							Claim: "role",
-							Value: "admin",
-							Roles: []string{
-								"dba",
-								"backup",
-								"root",
-							},
-						},
-					},
-				},
-			},
-		},
-		// 4 - oidc role templates
-		{
-			`
-auth_service:
-  authentication:
-    type: oidc
-    oidc:
-      id: google
-      redirect_url: "https://localhost:3080/v1/webapi/oidc/callback"
-      client_id: id-from-google.apps.googleusercontent.com
-      client_secret: secret-key-from-google
-      issuer_url: "https://accounts.google.com"
-      display: whaterver
-      scope: [ "roles" ]
-      claims_to_roles:
-        - claim: roles
-          value: teleport-admin
-          role_template:
-            kind: role
-            version: v2
-            metadata:
-              name: "{{index . \"email\"}}"
-              namespace: "default"
-            spec:
-              namespaces: [ "*" ]
-              max_session_ttl: 90h0m0s
-              logins: [ "{{index . \"nickname\"}}", root ]
-              node_labels:
-                 "*": "*"
-              resources:
-                "*": [ "read", "write" ]
-              forward_agent: true
-`,
-
-			&AuthenticationConfig{
-				Type: "oidc",
-				OIDC: &OIDCConnector{
-					ID:           "google",
-					RedirectURL:  "https://localhost:3080/v1/webapi/oidc/callback",
-					ClientID:     "id-from-google.apps.googleusercontent.com",
-					ClientSecret: "secret-key-from-google",
-					IssuerURL:    "https://accounts.google.com",
-					Display:      "whaterver",
-					Scope: []string{
-						"roles",
-					},
-					ClaimsToRoles: []ClaimMapping{
-						ClaimMapping{
-							Claim: "roles",
-							Value: "teleport-admin",
-							RoleTemplate: &services.RoleV2{
-								Kind:    services.KindRole,
-								Version: services.V2,
-								Metadata: services.Metadata{
-									Name:      `{{index . "email"}}`,
-									Namespace: defaults.Namespace,
-								},
-								Spec: services.RoleSpecV2{
-									MaxSessionTTL: services.NewDuration(90 * 60 * time.Minute),
-									Logins:        []string{`{{index . "nickname"}}`, `root`},
-									NodeLabels:    map[string]string{"*": "*"},
-									Namespaces:    []string{"*"},
-									Resources:     map[string][]string{"*": []string{"read", "write"}},
-									ForwardAgent:  true,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
 	}
 
 	// run tests
@@ -245,7 +123,6 @@ func (s *FileTestSuite) TestLegacyAuthenticationSection(c *check.C) {
 	c.Assert(fc.Auth.OIDCConnectors[0].IssuerURL, check.Equals, "https://accounts.google.com")
 
 	// validate u2f
-	c.Assert(fc.Auth.U2F.EnabledFlag, check.Equals, "yes")
 	c.Assert(fc.Auth.U2F.AppID, check.Equals, "https://graviton:3080")
 	c.Assert(fc.Auth.U2F.Facets, check.HasLen, 1)
 	c.Assert(fc.Auth.U2F.Facets[0], check.Equals, "https://graviton:3080")
