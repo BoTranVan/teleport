@@ -1,5 +1,5 @@
 /*
-Copyright 2015 Gravitational, Inc.
+Copyright 2015-2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -46,7 +46,9 @@ import (
 	"github.com/gravitational/teleport/lib/httplib"
 	"github.com/gravitational/teleport/lib/httplib/csrf"
 	"github.com/gravitational/teleport/lib/jwt"
+	"github.com/gravitational/teleport/lib/plugin"
 	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/secret"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
@@ -55,13 +57,12 @@ import (
 
 	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
+
 	"github.com/jonboulle/clockwork"
 	"github.com/julienschmidt/httprouter"
 	lemma_secret "github.com/mailgun/lemma/secret"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
-
-	"github.com/gravitational/teleport/lib/secret"
 )
 
 // Handler is HTTP web proxy handler
@@ -104,6 +105,8 @@ func SetClock(clock clockwork.Clock) HandlerOption {
 
 // Config represents web handler configuration parameters
 type Config struct {
+	// PluginRegistry handles plugin registration
+	PluginRegistry plugin.Registry
 	// Proxy is a reverse tunnel proxy that handles connections
 	// to local cluster or remote clusters using unified interface
 	Proxy reversetunnel.Tunnel
@@ -252,6 +255,11 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*RewritingHandler, error) {
 	h.POST("/webapi/sessions/renew", h.WithAuth(h.renewSession))
 	h.POST("/webapi/sessions/renew/:requestId", h.WithAuth(h.renewSession))
 
+	h.POST("/webapi/users", h.WithAuth(h.createUserHandle))
+	h.PUT("/webapi/users", h.WithAuth(h.updateUserHandle))
+	h.GET("/webapi/users", h.WithAuth(h.getUsersHandle))
+	h.DELETE("/webapi/users/:username", h.WithAuth(h.deleteUserHandle))
+
 	h.GET("/webapi/users/password/token/:token", httplib.MakeHandler(h.getResetPasswordTokenHandle))
 	h.PUT("/webapi/users/password/token", httplib.WithCSRFProtection(h.changePasswordWithToken))
 	h.PUT("/webapi/users/password", h.WithAuth(h.changePassword))
@@ -323,6 +331,21 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*RewritingHandler, error) {
 
 	// Issue host credentials.
 	h.POST("/webapi/host/credentials", httplib.MakeHandler(h.hostCredentials))
+
+	h.GET("/webapi/roles", h.WithAuth(h.getRolesHandle))
+	h.PUT("/webapi/roles", h.WithAuth(h.upsertRoleHandle))
+	h.POST("/webapi/roles", h.WithAuth(h.upsertRoleHandle))
+	h.DELETE("/webapi/roles/:name", h.WithAuth(h.deleteRole))
+
+	h.GET("/webapi/github", h.WithAuth(h.getGithubConnectorsHandle))
+	h.PUT("/webapi/github", h.WithAuth(h.upsertGithubConnectorHandle))
+	h.POST("/webapi/github", h.WithAuth(h.upsertGithubConnectorHandle))
+	h.DELETE("/webapi/github/:name", h.WithAuth(h.deleteGithubConnector))
+
+	h.GET("/webapi/trustedcluster", h.WithAuth(h.getTrustedClustersHandle))
+	h.PUT("/webapi/trustedcluster", h.WithAuth(h.upsertTrustedClusterHandle))
+	h.POST("/webapi/trustedcluster", h.WithAuth(h.upsertTrustedClusterHandle))
+	h.DELETE("/webapi/trustedcluster/:name", h.WithAuth(h.deleteTrustedCluster))
 
 	// if Web UI is enabled, check the assets dir:
 	var indexPage *template.Template
@@ -403,9 +426,11 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*RewritingHandler, error) {
 	})
 
 	h.NotFound = routingHandler
-	plugin := GetPlugin()
-	if plugin != nil {
-		plugin.AddHandlers(h)
+
+	if cfg.PluginRegistry != nil {
+		if err := cfg.PluginRegistry.RegisterProxyWebHandlers(h); err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	// Create application specific handler. This handler handles sessions and
@@ -446,33 +471,30 @@ func (h *Handler) Close() error {
 }
 
 func (h *Handler) getUserStatus(w http.ResponseWriter, r *http.Request, _ httprouter.Params, c *SessionContext) (interface{}, error) {
-	return ok(), nil
+	return OK(), nil
 }
 
 // getUserContext returns user context
 //
-// GET /webapi/user/context
+// GET /webapi/sites/:site/context
 //
 func (h *Handler) getUserContext(w http.ResponseWriter, r *http.Request, p httprouter.Params, c *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
+	roleset, err := c.GetCertRoles()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	clt, err := c.GetClient()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	cert, _, err := c.GetCertificates()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	roles, traits, err := services.ExtractFromCertificate(clt, cert)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	roleset, err := services.FetchRoles(roles, clt, traits)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	user, err := clt.GetUser(c.GetUser(), false)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	res, err := clt.GetAccessCapabilities(r.Context(), services.AccessCapabilitiesRequest{
+		RequestableRoles: true,
+	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -481,14 +503,6 @@ func (h *Handler) getUserContext(w http.ResponseWriter, r *http.Request, p httpr
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	res, err := clt.GetAccessCapabilities(r.Context(), services.AccessCapabilitiesRequest{
-		RequestableRoles: true,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	userContext.RequestableRoles = res.RequestableRoles
 	userContext.Cluster, err = ui.GetClusterDetails(site)
 	if err != nil {
@@ -1276,7 +1290,7 @@ func (h *Handler) deleteSession(w http.ResponseWriter, r *http.Request, _ httpro
 		return nil, trace.Wrap(err)
 	}
 
-	return ok(), nil
+	return OK(), nil
 }
 
 func (h *Handler) logout(w http.ResponseWriter, ctx *SessionContext) error {
@@ -1514,7 +1528,7 @@ type getSiteNamespacesResponse struct {
 
 /* getSiteNamespaces returns a list of namespaces for a given site
 
-GET /v1/webapi/namespaces/:namespace/sites/:site/nodes
+GET /v1/webapi/sites/:site/namespaces
 
 Successful response:
 
@@ -1534,6 +1548,11 @@ func (h *Handler) getSiteNamespaces(w http.ResponseWriter, r *http.Request, _ ht
 	}, nil
 }
 
+/* siteNodesGet returns a list of nodes for a given site and namespace
+
+GET /v1/webapi/sites/:site/namespaces/:namespace/nodes
+
+*/
 func (h *Handler) siteNodesGet(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
 	namespace := p.ByName("namespace")
 	if !services.IsValidNamespace(namespace) {
@@ -1904,41 +1923,44 @@ func (h *Handler) siteSessionStreamGet(w http.ResponseWriter, r *http.Request, p
 		h.log.WithError(err).Debug("Unable to retrieve session chunk.")
 		http.Error(w, err.Error(), trace.ErrorToCode(err))
 	}
+
 	// authenticate first:
 	ctx, err := h.AuthenticateRequest(w, r, true)
 	if err != nil {
 		h.log.WithError(err).Warn("Failed to authenticate.")
 		// clear session just in case if the authentication request is not valid
 		ClearSession(w)
-		onError(err)
+		onError(trace.Wrap(err))
 		return
 	}
+
 	// get the site interface:
 	siteName := p.ByName("site")
 	if siteName == currentSiteShortcut {
-		sites, err := h.cfg.Proxy.GetSites()
+		res, err := h.cfg.ProxyClient.GetClusterName()
 		if err != nil {
 			onError(trace.Wrap(err))
 			return
 		}
-		if len(sites) < 1 {
-			onError(trace.NotFound("no active sites"))
-			return
-		}
-		siteName = sites[0].GetName()
+		siteName = res.GetClusterName()
 	}
-	site, err = h.cfg.Proxy.GetSite(siteName)
+	proxy, err := h.ProxyWithRoles(ctx)
 	if err != nil {
-		onError(err)
+		onError(trace.Wrap(err))
 		return
 	}
+	site, err = proxy.GetSite(siteName)
+	if err != nil {
+		onError(trace.Wrap(err))
+		return
+	}
+
 	// get the session:
 	sid, err := session.ParseID(p.ByName("sid"))
 	if err != nil {
 		onError(trace.Wrap(err))
 		return
 	}
-
 	clt, err := ctx.GetUserClient(site)
 	if err != nil {
 		onError(trace.Wrap(err))
@@ -2188,6 +2210,7 @@ func (h *Handler) WithClusterAuth(fn ClusterHandler) httprouter.Handle {
 			h.log.WithError(err).Warn("Failed to authenticate.")
 			return nil, trace.Wrap(err)
 		}
+
 		clusterName := p.ByName("site")
 		if clusterName == currentSiteShortcut {
 			res, err := h.cfg.ProxyClient.GetClusterName()
@@ -2195,10 +2218,16 @@ func (h *Handler) WithClusterAuth(fn ClusterHandler) httprouter.Handle {
 				h.log.WithError(err).Warn("Failed to query cluster name.")
 				return nil, trace.Wrap(err)
 			}
-
 			clusterName = res.GetClusterName()
 		}
-		site, err := h.cfg.Proxy.GetSite(clusterName)
+
+		proxy, err := h.ProxyWithRoles(ctx)
+		if err != nil {
+			h.log.WithError(err).Warn("Failed to get proxy with roles.")
+			return nil, trace.Wrap(err)
+		}
+
+		site, err := proxy.GetSite(clusterName)
 		if err != nil {
 			h.log.WithError(err).WithField("cluster-name", clusterName).Warn("Failed to query site.")
 			return nil, trace.Wrap(err)
@@ -2269,6 +2298,17 @@ func (h *Handler) AuthenticateRequest(w http.ResponseWriter, r *http.Request, ch
 	return ctx, nil
 }
 
+// ProxyWithRoles returns a reverse tunnel proxy verifying the permissions
+// of the given user.
+func (h *Handler) ProxyWithRoles(ctx *SessionContext) (reversetunnel.Tunnel, error) {
+	roles, err := ctx.GetCertRoles()
+	if err != nil {
+		h.log.WithError(err).Warn("Failed to get client roles.")
+		return nil, trace.Wrap(err)
+	}
+	return reversetunnel.NewTunnelWithRoles(h.cfg.Proxy, roles, h.cfg.AccessPoint), nil
+}
+
 // ProxyHostPort returns the address of the proxy server using --proxy
 // notation, i.e. "localhost:8030,8023"
 func (h *Handler) ProxyHostPort() string {
@@ -2279,7 +2319,8 @@ func message(msg string) interface{} {
 	return map[string]interface{}{"message": msg}
 }
 
-func ok() interface{} {
+// OK is a response that indicates request was successful.
+func OK() interface{} {
 	return message("ok")
 }
 

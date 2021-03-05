@@ -237,11 +237,19 @@ func NewTestAuthServer(cfg TestAuthServerConfig) (*TestAuthServer, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	srv.Authorizer, err = NewAuthorizer(srv.AuthServer.Access, srv.AuthServer.Identity, srv.AuthServer.Trust)
+	srv.Authorizer, err = NewAuthorizer(srv.ClusterName, srv.AuthServer.Access, srv.AuthServer.Identity, srv.AuthServer.Trust)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return srv, nil
+}
+
+func (a *TestAuthServer) Close() error {
+	return trace.NewAggregate(
+		a.Backend.Close(),
+		a.AuditLog.Close(),
+		a.AuthServer.Close(),
+	)
 }
 
 // GenerateUserCert takes the public key in the OpenSSH `authorized_keys`
@@ -371,6 +379,7 @@ func (a *TestAuthServer) NewTestTLSServer() (*TestTLSServer, error) {
 		Authorizer:     a.Authorizer,
 		SessionService: a.SessionServer,
 		AuditLog:       a.AuditLog,
+		Emitter:        a.AuthServer.emitter,
 	}
 	srv, err := NewTestTLSServer(TestTLSServerConfig{
 		APIConfig:     apiConfig,
@@ -395,8 +404,13 @@ func (a *TestAuthServer) NewRemoteClient(identity TestIdentity, addr net.Addr, p
 	tlsConfig.RootCAs = pool
 	tlsConfig.ServerName = EncodeClusterName(a.ClusterName)
 	tlsConfig.Time = a.AuthServer.clock.Now
-	addrs := []string{addr.String()}
-	return NewClient(client.Config{Addrs: addrs, TLS: tlsConfig})
+
+	return NewClient(client.Config{
+		Addrs: []string{addr.String()},
+		Credentials: []client.Credentials{
+			client.LoadTLS(tlsConfig),
+		},
+	})
 }
 
 // TestTLSServerConfig is a configuration for test TLS server
@@ -565,8 +579,13 @@ func (t *TestTLSServer) NewClientFromWebSession(sess services.WebSession) (*Clie
 	}
 	tlsConfig.Certificates = []tls.Certificate{tlsCert}
 	tlsConfig.Time = t.AuthServer.AuthServer.clock.Now
-	addrs := []string{t.Addr().String()}
-	return NewClient(client.Config{Addrs: addrs, TLS: tlsConfig})
+
+	return NewClient(client.Config{
+		Addrs: []string{t.Addr().String()},
+		Credentials: []client.Credentials{
+			client.LoadTLS(tlsConfig),
+		},
+	})
 }
 
 // CertPool returns cert pool that auth server represents
@@ -602,8 +621,12 @@ func (t *TestTLSServer) ClientTLSConfig(identity TestIdentity) (*tls.Config, err
 // CloneClient uses the same credentials as the passed client
 // but forces the client to be recreated
 func (t *TestTLSServer) CloneClient(clt *Client) *Client {
-	addr := []string{t.Addr().String()}
-	newClient, err := NewClient(client.Config{Addrs: addr, TLS: clt.TLSConfig()})
+	newClient, err := NewClient(client.Config{
+		Addrs: []string{t.Addr().String()},
+		Credentials: []client.Credentials{
+			client.LoadTLS(clt.Config()),
+		},
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -616,8 +639,17 @@ func (t *TestTLSServer) NewClient(identity TestIdentity) (*Client, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	addrs := []string{t.Addr().String()}
-	return NewClient(client.Config{Addrs: addrs, TLS: tlsConfig})
+
+	newClient, err := NewClient(client.Config{
+		Addrs: []string{t.Addr().String()},
+		Credentials: []client.Credentials{
+			client.LoadTLS(tlsConfig),
+		},
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return newClient, nil
 }
 
 // Addr returns address of TLS server

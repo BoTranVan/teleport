@@ -42,7 +42,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
@@ -55,6 +55,7 @@ import (
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/shell"
+	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/teleport/lib/sshutils/scp"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
@@ -62,19 +63,18 @@ import (
 
 	"github.com/gravitational/trace"
 
-	"github.com/docker/docker/pkg/term"
 	"github.com/jonboulle/clockwork"
 	"github.com/sirupsen/logrus"
 )
-
-var log = logrus.WithFields(logrus.Fields{
-	trace.Component: teleport.ComponentClient,
-})
 
 const (
 	// ProfileDir is a directory location where tsh profiles (and session keys) are stored
 	ProfileDir = ".tsh"
 )
+
+var log = logrus.WithFields(logrus.Fields{
+	trace.Component: teleport.ComponentClient,
+})
 
 // ForwardedPort specifies local tunnel to remote
 // destination managed by the client, is equivalent
@@ -460,13 +460,9 @@ func readProfile(profileDir string, profileName string) (*ProfileStatus, error) 
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	publicKey, _, _, _, err := ssh.ParseAuthorizedKey(key.Cert)
+	sshCert, err := sshutils.ParseCertificate(key.Cert)
 	if err != nil {
 		return nil, trace.Wrap(err)
-	}
-	sshCert, ok := publicKey.(*ssh.Certificate)
-	if !ok {
-		return nil, trace.BadParameter("no certificate found")
 	}
 
 	// Extract from the certificate how much longer it will be valid for.
@@ -1337,11 +1333,11 @@ func (tc *TeleportClient) Play(ctx context.Context, namespace, sessionID string)
 
 	// configure terminal for direct unbuffered echo-less input:
 	if term.IsTerminal(0) {
-		state, err := term.SetRawTerminal(0)
+		state, err := term.MakeRaw(0)
 		if err != nil {
 			return nil
 		}
-		defer term.RestoreTerminal(0, state)
+		defer term.Restore(0, state)
 	}
 	player := newSessionPlayer(sessionEvents, stream)
 	// keys:
@@ -1522,6 +1518,7 @@ func (tc *TeleportClient) SCP(ctx context.Context, args []string, port int, flag
 }
 
 func (tc *TeleportClient) uploadConfig(ctx context.Context, tpl scp.Config, port int, args []string) (config *scpConfig, err error) {
+	// args are guaranteed to have len(args) > 1
 	filesToUpload := args[:len(args)-1]
 	// copy everything except the last arg (the destination)
 	destPath := args[len(args)-1]
@@ -1555,6 +1552,7 @@ func (tc *TeleportClient) uploadConfig(ctx context.Context, tpl scp.Config, port
 }
 
 func (tc *TeleportClient) downloadConfig(ctx context.Context, tpl scp.Config, port int, args []string) (config *scpConfig, err error) {
+	// args are guaranteed to have len(args) > 1
 	src, addr, err := getSCPDestination(args[0], port)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -2532,7 +2530,7 @@ func passwordFromConsole() (string, error) {
 	//
 	// nolint:unconvert
 	fd := int(syscall.Stdin)
-	state, err := terminal.GetState(fd)
+	state, err := term.GetState(fd)
 
 	// intercept Ctr+C and restore terminal
 	sigCh := make(chan os.Signal, 1)
@@ -2544,7 +2542,7 @@ func passwordFromConsole() (string, error) {
 		go func() {
 			select {
 			case <-sigCh:
-				terminal.Restore(fd, state)
+				term.Restore(fd, state)
 				os.Exit(1)
 			case <-closeCh:
 			}
@@ -2554,7 +2552,7 @@ func passwordFromConsole() (string, error) {
 		close(closeCh)
 	}()
 
-	bytes, err := terminal.ReadPassword(fd)
+	bytes, err := term.ReadPassword(fd)
 	return string(bytes), err
 }
 
