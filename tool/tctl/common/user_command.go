@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/asciitable"
 	"github.com/gravitational/teleport/lib/auth"
+	tclib "github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/service"
@@ -56,6 +58,9 @@ type UserCommand struct {
 
 	// format is the output format, e.g. text or json
 	format string
+
+	// namespace is node namespace
+	namespace string
 
 	userAdd           *kingpin.CmdClause
 	userUpdate        *kingpin.CmdClause
@@ -97,6 +102,7 @@ func (u *UserCommand) Initialize(app *kingpin.Application, config *service.Confi
 		defaults.SignupTokenTTL, defaults.MaxSignupTokenTTL)).
 		Default(fmt.Sprintf("%v", defaults.SignupTokenTTL)).DurationVar(&u.ttl)
 	u.userAdd.Flag("format", "Output format, 'text' or 'json'").Hidden().Default(teleport.Text).StringVar(&u.format)
+	u.userAdd.Flag("namespace", "Namespace of the nodes").Default(defaults.Namespace).StringVar(&u.namespace)
 	u.userAdd.Alias(AddUserHelp)
 
 	u.userUpdate = users.Command("update", "Update properties for existing user").Hidden()
@@ -261,6 +267,32 @@ func (u *UserCommand) Add(client auth.ClientI) error {
 
 	if err := u.PrintResetPasswordTokenAsInvite(token, u.format); err != nil {
 		return trace.Wrap(err)
+	}
+
+	nodes, err := client.GetNodes(u.namespace, services.SkipValidation())
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	for _, node := range nodes {
+		c := tclib.MakeDefaultConfig()
+		c.Host = node.GetHostname()
+		c.Namespace = u.namespace
+
+		tc, err := tclib.NewClient(c)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		tc.Stdin = os.Stdin
+		remoteCommand := []string{"useradd %s -ms /bin/sh" % u.login}
+		err = tclib.RetryWithRelogin(context.Context, tc, func() error {
+			tc.SSH(context.Context, remoteCommand, false)
+		})
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: ambiguous host could create a new user in nodes %s\n\n", c.Host)
+		}
 	}
 
 	return nil
